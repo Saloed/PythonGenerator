@@ -1,15 +1,27 @@
 import ast
 import html
+import random
 import re
 from collections import defaultdict
+from traceback import print_tb
 
 import timeout_decorator as td
 import pandas as pd
+import numpy as np
+import tensorflow as tf
 from multiprocessing import Pool
 
 import sys
 
-DICT_EXPAND_KEY = 'DICT_EXPAND_KEY'
+import smth_like_bpe
+import tree_transformers
+from some_net_stuff import Encoder
+from some_net_stuff.BatchBuilder import generate_batches
+from some_net_stuff.NetBuilder import build_net
+from some_net_stuff.TFParameters import init_params
+from tree_transformers import CONSTANT_LITERAL_TYPE
+from some_net import convert_to_node
+from some_net_stuff import Seq2Seq
 
 
 @td.timeout(10)
@@ -53,689 +65,13 @@ def parse(name):
     parsed.to_csv('ParsedData.csv')
 
 
-def set_parents_in_tree(root):
-    def set_parent(node):
-        for child in ast.iter_child_nodes(node):
-            child.parent = node
-        for child in ast.iter_child_nodes(node):
-            set_parent(child)
-
-    set_parent(root)
-
-
-class NodePereebator(ast.NodeVisitor):
-    def __init__(self, variable_names, function_names):
-        super(NodePereebator, self).__init__()
-        self.attribute_names = variable_names
-        self.function_names = function_names
-
-    def visit_Name(self, node: ast.Name):
-        if isinstance(node.parent, ast.Call) and getattr(node.parent, 'func', None) == node:
-            self.function_names[node.parent] = node.id
-
-    def visit_Attribute(self, node: ast.Attribute):
-        if isinstance(node.parent, ast.Call) and getattr(node.parent, 'func', None) == node:
-            self.attribute_names[node.parent] = node.attr
-
-
-class NodePerehuyator(ast.NodeTransformer):
-    def __init__(self, attribute_names, function_names):
-        super(NodePerehuyator, self).__init__()
-        self.common_functions = function_names
-        self.common_attributes = attribute_names
-        self.function_replace = {}
-        self.attribute_replace = {}
-
-    def visit_Name(self, node: ast.Name):
-        if node.id not in self.common_functions:
-            if node.id not in self.function_replace:
-                self.function_replace[node.id] = len(self.function_replace)
-            node.id = self.function_replace[node.id]
-
-    def visit_Attribute(self, node: ast.Attribute):
-        if node.attr not in self.common_attributes:
-            if node.attr not in self.attribute_replace:
-                self.attribute_replace[node.attr] = len(self.attribute_replace)
-            node.attr = self.attribute_replace[node.attr]
-
-
-class NodeUebator(ast.NodeTransformer):
-    def visit_AnnAssign(self, node: ast.AnnAssign):
-        node = super(NodeUebator, self).generic_visit(node)
-        return {
-            'type': 'Assign',
-            'targets': [node.target],
-            'value': node.value,
-        }
-
-    def visit_Assert(self, node: ast.Assert):
-        node = super(NodeUebator, self).generic_visit(node)
-        return {
-            'type': node.__class__.__name__,
-            'test': node.test,
-            'msg': node.msg,
-        }
-
-    def visit_Assign(self, node: ast.Assign):
-        node = super(NodeUebator, self).generic_visit(node)
-        return {
-            'type': node.__class__.__name__,
-            'targets': node.targets,
-            'value': node.value,
-        }
-
-    def visit_AsyncFor(self, node: ast.AsyncFor):
-        node = super(NodeUebator, self).generic_visit(node)
-        pass
-
-    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef):
-        node = super(NodeUebator, self).generic_visit(node)
-        pass
-
-    def visit_AsyncWith(self, node: ast.AsyncWith):
-        node = super(NodeUebator, self).generic_visit(node)
-        pass
-
-    def visit_Attribute(self, node: ast.Attribute):
-        node = super(NodeUebator, self).generic_visit(node)
-        return {
-            'type': node.__class__.__name__,
-            'value': node.value,
-            'attr': node.attr,
-        }
-
-    def visit_AugAssign(self, node: ast.AugAssign):
-        node = super(NodeUebator, self).generic_visit(node)
-        return {
-            'type': node.__class__.__name__,
-            'target': node.target,
-            'value': node.value,
-            'op': node.op,
-        }
-
-    def visit_AugLoad(self, node: ast.AugLoad):
-        node = super(NodeUebator, self).generic_visit(node)
-        pass
-
-    def visit_AugStore(self, node: ast.AugStore):
-        node = super(NodeUebator, self).generic_visit(node)
-        pass
-
-    def visit_Await(self, node: ast.Await):
-        node = super(NodeUebator, self).generic_visit(node)
-        pass
-
-    def visit_BinOp(self, node: ast.BinOp):
-        node = super(NodeUebator, self).generic_visit(node)
-        return {
-            'type': node.op['type'],
-            'left': node.left,
-            'right': node.right,
-        }
-
-    def visit_BoolOp(self, node: ast.BoolOp):
-        node = super(NodeUebator, self).generic_visit(node)
-        return {
-            'type': node.op['type'],
-            'values': list(node.values),
-        }
-
-    def visit_Break(self, node: ast.Break):
-        return {
-            'type': node.__class__.__name__,
-        }
-
-    def visit_Bytes(self, node: ast.Bytes):
-        return {
-            'type': node.__class__.__name__,
-            'value': str(node.s),
-        }
-
-    def visit_Call(self, node: ast.Call):
-        node = super(NodeUebator, self).generic_visit(node)
-        return {
-            'type': node.__class__.__name__,
-            'func': node.func,
-            'args': node.args,
-            'keywords': node.keywords,
-        }
-
-    def visit_ClassDef(self, node: ast.ClassDef):
-        node = super(NodeUebator, self).generic_visit(node)
-        pass
-
-    def visit_Compare(self, node: ast.Compare):
-        node = super(NodeUebator, self).generic_visit(node)
-        return {
-            'type': node.__class__.__name__,
-            'left': node.left,
-            'ops': node.ops,
-            'comparators': node.comparators,
-        }
-
-    def visit_Constant(self, node: ast.Constant):
-        node = super(NodeUebator, self).generic_visit(node)
-        pass
-
-    def visit_Continue(self, node: ast.Continue):
-        return {
-            'type': node.__class__.__name__,
-        }
-
-    def visit_Del(self, node: ast.Del):
-        return {
-            'type': node.__class__.__name__,
-        }
-
-    def visit_Delete(self, node: ast.Delete):
-        node = super(NodeUebator, self).generic_visit(node)
-        return {
-            'type': node.__class__.__name__,
-            'targets': node.targets,
-        }
-
-    def visit_Dict(self, node: ast.Dict):
-        node = super(NodeUebator, self).generic_visit(node)
-        return {
-            'type': node.__class__.__name__,
-            'values': node.values,
-            'keys': [key or DICT_EXPAND_KEY for key in node.keys]
-        }
-
-    def visit_DictComp(self, node: ast.DictComp):
-        node = super(NodeUebator, self).generic_visit(node)
-        pass
-
-    def visit_Ellipsis(self, node: ast.Ellipsis):
-        return {
-            'type': node.__class__.__name__,
-        }
-
-    def visit_ExceptHandler(self, node: ast.ExceptHandler):
-        node = super(NodeUebator, self).generic_visit(node)
-        return {
-            'type': node.__class__.__name__,
-            'exception_type': node.type,
-            'body': node.body,
-            'name': node.name,
-        }
-
-    def visit_Expr(self, node: ast.Expr):
-        node = super(NodeUebator, self).generic_visit(node)
-        return {
-            'type': node.__class__.__name__,
-            'value': node.value,
-        }
-
-    def visit_Expression(self, node: ast.Expression):
-        node = super(NodeUebator, self).generic_visit(node)
-        pass
-
-    def visit_ExtSlice(self, node: ast.ExtSlice):
-        node = super(NodeUebator, self).generic_visit(node)
-        return {
-            'type': node.__class__.__name__,
-            'dims': node.dims,
-        }
-
-    def visit_For(self, node: ast.For):
-        node = super(NodeUebator, self).generic_visit(node)
-        return {
-            'type': node.__class__.__name__,
-            'target': node.test,
-            'iter': node.iter,
-            'then': node.body,
-            'else': node.orelse,
-        }
-
-    def visit_FormattedValue(self, node: ast.FormattedValue):
-        node = super(NodeUebator, self).generic_visit(node)
-        return {
-            'type': node.__class__.__name__,
-            'value': node.value,
-            'format': node.format_spec or {
-                'type': 'Str',
-                'value': '',
-            }
-        }
-
-    def visit_FunctionDef(self, node: ast.FunctionDef):
-        node = super(NodeUebator, self).generic_visit(node)
-        return {
-            'type': node.__class__.__name__,
-            'name': {
-                'type': 'Name',
-                'value': node.name,
-            },
-            'args': node.args,
-            'body': node.body,
-            'decorators': node.decorator_list,
-        }
-
-    def visit_GeneratorExp(self, node: ast.GeneratorExp):
-        node = super(NodeUebator, self).generic_visit(node)
-        return {
-            'type': node.__class__.__name__,
-            'element': node.elt,
-            'generators': node.generators,
-        }
-
-    def visit_Global(self, node: ast.Global):
-        node = super(NodeUebator, self).generic_visit(node)
-        pass
-
-    def visit_If(self, node: ast.If):
-        node = super(NodeUebator, self).generic_visit(node)
-        return {
-            'type': node.__class__.__name__,
-            'test': node.test,
-            'then': node.body,
-            'else': node.orelse,
-        }
-
-    def visit_IfExp(self, node: ast.IfExp):
-        node = super(NodeUebator, self).generic_visit(node)
-        return {
-            'type': node.__class__.__name__,
-            'test': node.test,
-            'then': node.body,
-            'else': node.orelse,
-        }
-
-    def visit_Import(self, node: ast.Import):
-        node = super(NodeUebator, self).generic_visit(node)
-        return {
-            'type': node.__class__.__name__,
-            'names': node.names,
-        }
-
-    def visit_ImportFrom(self, node: ast.ImportFrom):
-        node = super(NodeUebator, self).generic_visit(node)
-        return {
-            'type': node.__class__.__name__,
-            'names': node.names,
-            'module': node.module,
-            'level': str(node.level),
-        }
-
-    def visit_Index(self, node: ast.Index):
-        node = super(NodeUebator, self).generic_visit(node)
-        return {
-            'type': node.__class__.__name__,
-            'value': node.value,
-        }
-
-    def visit_Interactive(self, node: ast.Interactive):
-        node = super(NodeUebator, self).generic_visit(node)
-        pass
-
-    def visit_JoinedStr(self, node: ast.JoinedStr):
-        node = super(NodeUebator, self).generic_visit(node)
-        return {
-            'type': node.__class__.__name__,
-            'values': node.values,
-        }
-
-    def visit_Lambda(self, node: ast.Lambda):
-        node = super(NodeUebator, self).generic_visit(node)
-        return {
-            'type': node.__class__.__name__,
-            'args': node.args,
-            'body': node.body,
-        }
-
-    def visit_List(self, node: ast.List):
-        node = super(NodeUebator, self).generic_visit(node)
-        return {
-            'type': node.__class__.__name__,
-            'elements': node.elts,
-        }
-
-    def visit_ListComp(self, node: ast.ListComp):
-        node = super(NodeUebator, self).generic_visit(node)
-        return {
-            'type': node.__class__.__name__,
-            'element': node.elt,
-            'generators': node.generators,
-        }
-
-    def visit_Load(self, node: ast.Load):
-        return {
-            'type': node.__class__.__name__,
-        }
-
-    def visit_Module(self, node: ast.Module):
-        node = super(NodeUebator, self).generic_visit(node)
-        pass
-
-    def visit_Name(self, node: ast.Name):
-        return {
-            'type': node.__class__.__name__,
-            'value': node.id,
-        }
-
-    def visit_NameConstant(self, node: ast.NameConstant):
-        return {
-            'type': node.__class__.__name__,
-            'value': str(node.value),
-        }
-
-    def visit_Nonlocal(self, node: ast.Nonlocal):
-        node = super(NodeUebator, self).generic_visit(node)
-        pass
-
-    def visit_Num(self, node: ast.Num):
-        return {
-            'type': node.__class__.__name__,
-            'value': str(node.n),
-        }
-
-    def visit_Param(self, node: ast.Param):
-        return {
-            'type': node.__class__.__name__,
-        }
-
-    def visit_Pass(self, node: ast.Pass):
-        return {
-            'type': node.__class__.__name__,
-        }
-
-    def visit_Raise(self, node: ast.Raise):
-        node = super(NodeUebator, self).generic_visit(node)
-        return {
-            'type': node.__class__.__name__,
-            'exc': node.exc,
-            'cause': node.cause,
-        }
-
-    def visit_Return(self, node: ast.Return):
-        node = super(NodeUebator, self).generic_visit(node)
-        pass
-
-    def visit_Set(self, node: ast.Set):
-        node = super(NodeUebator, self).generic_visit(node)
-        return {
-            'type': node.__class__.__name__,
-            'elements': node.elts,
-        }
-
-    def visit_SetComp(self, node: ast.SetComp):
-        node = super(NodeUebator, self).generic_visit(node)
-        return {
-            'type': node.__class__.__name__,
-            'element': node.elt,
-            'generators': node.generators,
-        }
-
-    def visit_Slice(self, node: ast.Slice):
-        node = super(NodeUebator, self).generic_visit(node)
-        return {
-            'type': node.__class__.__name__,
-            'lower': node.lower,
-            'upper': node.upper,
-            'step': node.step,
-        }
-
-    def visit_Starred(self, node: ast.Starred):
-        node = super(NodeUebator, self).generic_visit(node)
-        return {
-            'type': node.__class__.__name__,
-            'value': node.value,
-        }
-
-    def visit_Store(self, node: ast.Store):
-        return {
-            'type': node.__class__.__name__,
-        }
-
-    def visit_Str(self, node: ast.Str):
-        return {
-            'type': node.__class__.__name__,
-            'value': str(node.s),
-        }
-
-    def visit_Subscript(self, node: ast.Subscript):
-        node = super(NodeUebator, self).generic_visit(node)
-        return {
-            'type': node.__class__.__name__,
-            'value': node.value,
-            'slice': node.slice,
-            'operation': node.ctx,
-        }
-
-    def visit_Suite(self, node: ast.Suite):
-        node = super(NodeUebator, self).generic_visit(node)
-        pass
-
-    def visit_Try(self, node: ast.Try):
-        node = super(NodeUebator, self).generic_visit(node)
-        return {
-            'type': node.__class__.__name__,
-            'body': node.body,
-            'handlers': node.handlers,
-            'else': node.orelse,
-            'final': node.finalbody,
-        }
-
-    def visit_Tuple(self, node: ast.Tuple):
-        node = super(NodeUebator, self).generic_visit(node)
-        return {
-            'type': node.__class__.__name__,
-            'elements': node.elts,
-        }
-
-    def visit_UnaryOp(self, node: ast.UnaryOp):
-        node = super(NodeUebator, self).generic_visit(node)
-        return {
-            'type': node.op['type'],
-            'operand': node.operand,
-        }
-
-    def visit_While(self, node: ast.While):
-        node = super(NodeUebator, self).generic_visit(node)
-        return {
-            'type': node.__class__.__name__,
-            'test': node.test,
-            'then': node.body,
-            'else': node.orelse,
-        }
-
-    def visit_With(self, node: ast.With):
-        node = super(NodeUebator, self).generic_visit(node)
-        return {
-            'type': node.__class__.__name__,
-            'items': node.items,
-            'body': node.body,
-        }
-
-    def visit_Yield(self, node: ast.Yield):
-        node = super(NodeUebator, self).generic_visit(node)
-        pass
-
-    def visit_YieldFrom(self, node: ast.YieldFrom):
-        node = super(NodeUebator, self).generic_visit(node)
-        pass
-
-    def visit_alias(self, node: ast.alias):
-        return {
-            'type': node.__class__.__name__,
-            'name': node.name,
-            'asname': node.asname,
-        }
-
-    def visit_arg(self, node: ast.arg):
-        node = super(NodeUebator, self).generic_visit(node)
-        pass
-
-    def visit_arguments(self, node: ast.arguments):
-        node = super(NodeUebator, self).generic_visit(node)
-        return {
-            'type': node.__class__.__name__,
-            # todo: aaaaaaaaaaaaaaaaaa
-        }
-
-    def visit_comprehension(self, node: ast.comprehension):
-        node = super(NodeUebator, self).generic_visit(node)
-        return {
-            'type': node.__class__.__name__,
-            'iter': node.iter,
-            'target': node.target,
-            'ifs': node.ifs,
-        }
-
-    def visit_excepthandler(self, node: ast.excepthandler):
-        node = super(NodeUebator, self).generic_visit(node)
-        pass
-
-    def visit_expr(self, node: ast.expr):
-        node = super(NodeUebator, self).generic_visit(node)
-        pass
-
-    def visit_expr_context(self, node: ast.expr_context):
-        node = super(NodeUebator, self).generic_visit(node)
-        pass
-
-    def visit_keyword(self, node: ast.keyword):
-        node = super(NodeUebator, self).generic_visit(node)
-        return {
-            'type': node.__class__.__name__,
-            'arg': {
-                'type': 'Name',
-                'value': node.arg,
-            },
-            'value': node.value,
-        }
-
-    def visit_mod(self, node: ast.mod):
-        node = super(NodeUebator, self).generic_visit(node)
-        pass
-
-    def visit_slice(self, node: ast.slice):
-        node = super(NodeUebator, self).generic_visit(node)
-        pass
-
-    def visit_stmt(self, node: ast.stmt):
-        node = super(NodeUebator, self).generic_visit(node)
-        pass
-
-    def visit_withitem(self, node: ast.withitem):
-        node = super(NodeUebator, self).generic_visit(node)
-        return {
-            'type': node.__class__.__name__,
-            'context_expr': node.context_expr,
-            'optional_vars': node.optional_vars,
-        }
-
-    def visit_Add(self, node):
-        return self.visit_operator(node)
-
-    def visit_BitAnd(self, node):
-        return self.visit_operator(node)
-
-    def visit_BitOr(self, node):
-        return self.visit_operator(node)
-
-    def visit_BitXor(self, node):
-        return self.visit_operator(node)
-
-    def visit_Div(self, node):
-        return self.visit_operator(node)
-
-    def visit_FloorDiv(self, node):
-        return self.visit_operator(node)
-
-    def visit_LShift(self, node):
-        return self.visit_operator(node)
-
-    def visit_MatMult(self, node):
-        return self.visit_operator(node)
-
-    def visit_Mod(self, node):
-        return self.visit_operator(node)
-
-    def visit_Mult(self, node):
-        return self.visit_operator(node)
-
-    def visit_Pow(self, node):
-        return self.visit_operator(node)
-
-    def visit_RShift(self, node):
-        return self.visit_operator(node)
-
-    def visit_Sub(self, node):
-        return self.visit_operator(node)
-
-    def visit_operator(self, node: ast.operator):
-        return {
-            'type': node.__class__.__name__,
-        }
-
-    def visit_Invert(self, node):
-        return self.visit_unaryop(node)
-
-    def visit_Not(self, node):
-        return self.visit_unaryop(node)
-
-    def visit_UAdd(self, node):
-        return self.visit_unaryop(node)
-
-    def visit_USub(self, node):
-        return self.visit_unaryop(node)
-
-    def visit_unaryop(self, node: ast.unaryop):
-        return {
-            'type': node.__class__.__name__,
-        }
-
-    def visit_And(self, node):
-        return self.visit_boolop(node)
-
-    def visit_Or(self, node):
-        return self.visit_boolop(node)
-
-    def visit_boolop(self, node):
-        return {
-            'type': node.__class__.__name__,
-        }
-
-    def visit_Eq(self, node):
-        return self.visit_cmpop(node)
-
-    def visit_Gt(self, node):
-        return self.visit_cmpop(node)
-
-    def visit_GtE(self, node):
-        return self.visit_cmpop(node)
-
-    def visit_In(self, node):
-        return self.visit_cmpop(node)
-
-    def visit_Is(self, node):
-        return self.visit_cmpop(node)
-
-    def visit_IsNot(self, node):
-        return self.visit_cmpop(node)
-
-    def visit_Lt(self, node):
-        return self.visit_cmpop(node)
-
-    def visit_LtE(self, node):
-        return self.visit_cmpop(node)
-
-    def visit_NotEq(self, node):
-        return self.visit_cmpop(node)
-
-    def visit_NotIn(self, node):
-        return self.visit_cmpop(node)
-
-    def visit_cmpop(self, node):
-        return {
-            'type': node.__class__.__name__,
-        }
-
-
-def transform_tree(tree):
-    pass
+def transform_tree(tree, text):
+    # try:
+    return tree_transformers.NodeUebator().visit(tree)
+    # except Exception as ex:
+    #     print(ex)
+    #     # print(text)
+    #     return None
 
 
 def extract_common_names(root, text):
@@ -755,8 +91,8 @@ def extract_common_names(root, text):
     #     return result
     try:
         attribute_names, function_names = {}, {}
-        set_parents_in_tree(root)
-        node = NodePereebator(attribute_names, function_names).visit(root)
+        tree_transformers.set_parents_in_tree(root)
+        node = tree_transformers.NodePereebator(attribute_names, function_names).visit(root)
     except Exception as ex:
         print(ex)
         return None
@@ -764,16 +100,566 @@ def extract_common_names(root, text):
 
 
 def replace_names(root, attribute_names, function_names):
-    return NodePerehuyator(attribute_names, function_names).visit(root)
+    return tree_transformers.NodePerehuyator(attribute_names, function_names).visit(root)
+
+
+def count_items(_list, sort=False):
+    items_with_count = defaultdict(int)
+    for it in _list:
+        items_with_count[it] += 1
+    items_with_count = list(items_with_count.items())
+    if sort:
+        items_with_count.sort(key=lambda it: it[1], reverse=True)
+    return items_with_count
 
 
 def get_most_common_names(all_names):
-    common_names = defaultdict(int)
-    for name in all_names:
-        common_names[name] += 1
-    common_names = list(common_names.items())
-    common_names.sort(key=lambda it: it[1], reverse=True)
+    common_names = count_items(all_names, sort=True)
     return {name for name, count in common_names[:100]}
+
+
+def get_constant_literals(node, literals=None):
+    if literals is None:
+        literals = []
+    if not isinstance(node, dict):
+        return literals
+    if node['type'] == tree_transformers.CONSTANT_LITERAL_TYPE:
+        literals.append(node['value'])
+        return literals
+    for field, value in node.items():
+        if field == 'type':
+            continue
+        if not isinstance(value, list):
+            value = [value]
+        for it in value:
+            get_constant_literals(it, literals)
+    return literals
+
+
+def tree_to_token_stream(tree):
+    pass
+
+
+def children_as_list(tree):
+    if not isinstance(tree, dict):
+        return tree
+    if tree['type'] in [CONSTANT_LITERAL_TYPE, tree_transformers.EMPTY_TOKEN]:
+        return tree
+    children = []
+    for name, node in tree.items():
+        if name == 'type':
+            continue
+        if not isinstance(node, list):
+            node = [node]
+        children += [children_as_list(it) for it in node]
+
+    return {
+        'type': tree['type'],
+        'children': children,
+    }
+
+
+def replace_empty_tokens(tree):
+    if not isinstance(tree, dict):
+        return tree
+    for name, node in tree.items():
+        if node is None:
+            tree[name] = tree_transformers.make_empty_token()
+            continue
+        if not isinstance(node, list):
+            node = [node]
+        for it in node:
+            replace_empty_tokens(it)
+    return tree
+
+
+def find_non_terminals(tree, parent=None):
+    if not isinstance(tree, dict):
+        return [parent]
+    result = []
+    if tree['type'] == CONSTANT_LITERAL_TYPE:
+        return result
+    for name, node in tree.items():
+        if name == 'type':
+            continue
+        if isinstance(node, list):
+            result += [x for it in node for x in find_non_terminals(it, tree)]
+        else:
+            result += find_non_terminals(node, tree)
+
+    return result
+
+
+def extract_tokens_from_tree(tree):
+    return [
+               tree['type']
+           ] + [
+               token
+               for child in tree.get('children', [])
+               for token in extract_tokens_from_tree(child)
+           ]
+
+
+def extract_tokens(trees):
+    tokens = [extract_tokens_from_tree(tree) for tree in trees]
+    result = set()
+    for t in tokens:
+        result |= set(t)
+    result = list(result)
+    result.sort()
+    return result
+
+
+import matplotlib.pyplot as plotter
+
+
+def new_figure(num, epoch_in_retry, max_y):
+    x = np.arange(0, epoch_in_retry, 1)
+    yv = np.full(epoch_in_retry, -1.1)
+    yt = np.full(epoch_in_retry, -1.1)
+    fig = plotter.figure(num)
+    fig.set_size_inches(10, 10)
+    ax = fig.add_subplot(1, 1, 1)
+    ax.set_xlim(0, epoch_in_retry)
+    ax.set_ylim(0, max_y)
+    ax.set_xlabel('epoch')
+    ax.set_ylabel('error')
+    ax.grid(True)
+    line = ax.plot(x, yv, 'r.', x, yt, 'b.')
+    fig.show(False)
+    fig.canvas.draw()
+    return line, fig
+
+
+def update_figure(plot, axes, x, yv, yt):
+    new_data = axes[0].get_ydata()
+    new_data[x] = yv
+    axes[0].set_ydata(new_data)
+    new_data = axes[1].get_ydata()
+    new_data[x] = yt
+    axes[1].set_ydata(new_data)
+    plot.canvas.draw()
+
+
+def shuffle_data_set(code, text):
+    combined = [(c, t) for c, t in zip(code, text)]
+    random.shuffle(combined)
+    shuffled_code = [c for c, _ in combined]
+    shuffled_text = [t for _, t in combined]
+    return shuffled_code, shuffled_text
+
+
+def rand_int_except(i, bot, top):
+    res = random.randint(bot, top)
+    while res == i:
+        res = random.randint(bot, top)
+    return res
+
+
+def make_samples(text, positive, negative, samples_cnt):
+    for i, (txt, code) in enumerate(zip(text, positive)):
+        for _ in range(samples_cnt):
+            neg = negative[rand_int_except(i, 0, len(negative) - 1)]
+            yield txt, code, neg
+
+
+def make_samples_feed(text, positive, negative, samples_cnt):
+    for txt, pos, neg in make_samples(text, positive, negative, samples_cnt):
+        yield {k: v for k, v in list(pos.items()) + list(txt.items()) + list(neg.items())}
+
+
+def split_batches(batches, split_size):
+    split_position = len(batches) // split_size
+    return batches[:split_position], batches[split_position:]
+
+
+def get_sample_embs(samples, num_tokens, just_zero=False):
+    return np.asarray(samples), np.asarray([
+        [
+            np.eye(num_tokens)[it] if not just_zero else np.zeros([num_tokens])
+            for it in sample
+        ]
+        for sample in samples
+    ])
+
+
+def group_text_by_batches(text, batch_size, num_tokens, time_major=False):
+    end_marker = num_tokens - 1
+
+    def allign_batch(batch):
+        lens = [len(b) for b in batch]
+        max_len = max(lens)
+        result_samples = [
+            sample + [end_marker for _ in range(max_len - sample_len + 1)]
+            for sample, sample_len in zip(batch, lens)
+        ]
+        result = result_samples
+        if time_major:
+            result = [[] for _ in range(max_len + 1)]
+            for j in range(max_len + 1):
+                for sample in result_samples:
+                    result[j].append(sample[j])
+
+        result_lens = np.asarray([ln + 1 for ln in lens])
+        return result, result_lens
+
+    size = len(text) // batch_size
+    batches = []
+    for j in range(size):
+        ind = j * batch_size
+        d = text[ind:ind + batch_size]
+        d = allign_batch(d)
+        batches.append(d)
+    return batches
+
+
+def seq2seq_input_check(num_text_inputs, indexed_text_inputs):
+    batch_size = 10
+    num_text_inputs_with_end = num_text_inputs + 1
+    inputs, input_length, targets, target_labels, target_length, loss = Seq2Seq.build_model(
+        batch_size,
+        num_text_inputs_with_end,
+        num_text_inputs_with_end,
+    )
+    text_batches = group_text_by_batches(indexed_text_inputs, batch_size, num_text_inputs_with_end, True)
+    valid, train = split_batches(text_batches, 10)
+    updates = tf.train.AdamOptimizer().minimize(loss)
+    config = tf.ConfigProto()
+    config.graph_options.optimizer_options.global_jit_level = tf.OptimizerOptions.ON_1
+    initializer = tf.global_variables_initializer()
+    tf.summary.scalar('loss', loss)
+    summaries = tf.summary.merge_all()
+
+    with tf.Session(config=config) as sess, tf.device('/cpu:0'):
+        summary_writer = tf.summary.FileWriter('models', sess.graph)
+        sess.run(initializer)
+        try:
+            for train_epoch in range(100):
+                print(f'start epoch {train_epoch}')
+                res = []
+                batch_count = len(train)
+                for j, (sample, sample_lens) in enumerate(train):
+                    sample, sample_embs = get_sample_embs(sample, num_text_inputs_with_end)
+                    err, summary, _ = sess.run(fetches=[loss, summaries, updates], feed_dict={
+                        inputs: sample_embs,
+                        input_length: sample_lens,
+                        targets: sample_embs,
+                        target_labels: sample,
+                        target_length: sample_lens,
+                    })
+                    summary_writer.add_summary(summary, train_epoch * batch_count + j)
+
+                    res.append(float(err))
+                    batch_number = j + 1
+                    if batch_number % 100 == 0:
+                        percent = int(j / batch_count * 100)
+                        print(f'Complete {percent}')
+
+                tr_loss = np.mean(res)
+                print('valid epoch')
+                res = []
+                for sample, sample_lens in valid:
+                    sample, sample_embs = get_sample_embs(sample, num_text_inputs_with_end)
+                    err, *_ = sess.run(fetches=[loss], feed_dict={
+                        inputs: sample_embs,
+                        input_length: sample_lens,
+                        targets: sample_embs,
+                        target_labels: sample,
+                        target_length: sample_lens,
+                    })
+                    res.append(float(err))
+
+                v_loss = np.mean(res)
+
+                print(f'epoch {train_epoch} train {tr_loss} valid {v_loss}')
+
+        except Exception as ex:
+            print(ex)
+            print_tb(ex.__traceback__)
+
+
+def group_text_and_code_by_batches(text, code, batch_size, text_tokens_with_end, code_tokens_with_end):
+    text_end_marker = text_tokens_with_end - 1
+    code_end_marker = code_tokens_with_end - 1
+    text_start_marker = text_tokens_with_end - 2
+    code_start_marker = code_tokens_with_end - 2
+
+    def allign_batch(batch, end_marker, start_marker):
+        lens = [len(b) for b in batch]
+        max_len = max(lens)
+        result_samples = [
+            [start_marker] + sample + [end_marker for _ in range(max_len - sample_len + 1)]
+            for sample, sample_len in zip(batch, lens)
+        ]
+        result = [[] for _ in range(max_len + 2)]
+        for j in range(max_len + 1):
+            for sample in result_samples:
+                result[j].append(sample[j])
+
+        result_lens = np.asarray([ln + 2 for ln in lens])
+        return result, result_lens
+
+    text_with_code = list(zip(text, code))
+
+    size = len(text_with_code) // batch_size
+    batches = []
+    for j in range(size):
+        ind = j * batch_size
+        d = text_with_code[ind:ind + batch_size]
+        txt = [t for t, _ in d]
+        cd = [c for _, c in d]
+        txt = allign_batch(txt, text_end_marker, text_start_marker)
+        cd = allign_batch(cd, code_end_marker, code_start_marker)
+        batches.append((txt, cd))
+    return batches
+
+
+def run_seq2seq_model(
+        data_set,
+        model,
+        session,
+        num_text_tokens_with_end,
+        num_code_tokens_with_end,
+        epoch,
+        is_train,
+        updates=None,
+        summary_writer=None,
+        summaries=None
+):
+    inputs, input_length, targets, target_labels, target_length, loss = model
+    fetches = [loss]
+    if is_train:
+        fetches += [summaries, updates]
+    res = []
+    batch_count = len(data_set)
+    for j, ((text, text_lens), (code, code_lens)) in enumerate(data_set):
+        text, text_embs = get_sample_embs(text, num_text_tokens_with_end)
+        code, code_embs = get_sample_embs(code, num_code_tokens_with_end)
+        feed = {
+            inputs: text_embs,
+            input_length: text_lens,
+            target_labels: code,
+            target_length: code_lens,
+        }
+        if is_train:
+            feed[targets] = code_embs
+        results = session.run(fetches=fetches, feed_dict=feed)
+        if is_train:
+            err, summary, _ = results
+            summary_writer.add_summary(summary, epoch * batch_count + j)
+        else:
+            err = results[0]
+
+        res.append(float(err))
+        batch_number = j + 1
+        if batch_number % 100 == 0:
+            percent = int(j / batch_count * 100)
+            print(f'Complete {percent}')
+
+    return np.mean(res)
+
+
+def build_loss_summary(model):
+    *_, loss = model
+    tf.summary.scalar('loss', loss)
+    return tf.summary.merge_all()
+
+
+def build_updates(model):
+    *_, loss = model
+    return tf.train.AdamOptimizer().minimize(loss)
+
+
+def seq2seq_text2code(text, code, num_text_tokens, num_code_tokens):
+    batch_size = 10
+    num_text_tokens_with_end = num_text_tokens + 2
+    num_code_tokens_with_end = num_code_tokens + 2
+
+    train_model = Seq2Seq.build_model(
+        batch_size,
+        num_text_tokens_with_end,
+        num_code_tokens_with_end,
+        is_in_train_mode=True,
+    )
+    valid_model = Seq2Seq.build_model(
+        batch_size,
+        num_text_tokens_with_end,
+        num_code_tokens_with_end,
+        is_in_train_mode=False,
+    )
+
+    batches = group_text_and_code_by_batches(text, code, batch_size, num_text_tokens_with_end, num_code_tokens_with_end)
+    valid, train = split_batches(batches, 10)
+
+    config = tf.ConfigProto()
+    config.graph_options.optimizer_options.global_jit_level = tf.OptimizerOptions.ON_1
+
+    initializer = tf.global_variables_initializer()
+    train_summaries = build_loss_summary(train_model)
+    train_updates = build_updates(train_model)
+
+    saver = tf.train.Saver(max_to_keep=100)
+
+    with tf.Session(config=config) as sess, tf.device('/cpu:0'):
+        summary_writer = tf.summary.FileWriter('models', sess.graph)
+        sess.run(initializer)
+        try:
+            for train_epoch in range(100):
+                print(f'start epoch {train_epoch}')
+                tr_loss = run_seq2seq_model(
+                    data_set=train,
+                    model=train_model,
+                    session=sess,
+                    num_text_tokens_with_end=num_text_tokens_with_end,
+                    num_code_tokens_with_end=num_code_tokens_with_end,
+                    epoch=train_epoch,
+                    is_train=True,
+                    updates=train_updates,
+                    summary_writer=summary_writer,
+                    summaries=train_summaries,
+                )
+                print('valid epoch')
+                v_loss = run_seq2seq_model(
+                    data_set=valid,
+                    model=valid_model,
+                    session=sess,
+                    num_text_tokens_with_end=num_text_tokens_with_end,
+                    num_code_tokens_with_end=num_code_tokens_with_end,
+                    epoch=train_epoch,
+                    is_train=False,
+                )
+                saver.save(sess, 'models/model', train_epoch)
+                print(f'epoch {train_epoch} train {tr_loss} valid {v_loss}')
+
+        except Exception as ex:
+            print(ex)
+            print_tb(ex.__traceback__)
+
+
+def pretrain_with_negative_samples(tokens, code_inputs, characters, indexed_text_inputs):
+    params, emb_indexes = init_params(tokens)
+    net = build_net(params)
+    negative_net = build_net(params)
+    code_batches = generate_batches(code_inputs, emb_indexes, net, 0.8)
+    negative_code_batches = generate_batches(code_inputs, emb_indexes, negative_net, 1.0)
+
+    text_input_pc, encoder_out, empty_token_idx = Encoder.get_net(len(characters))
+    text_input_batches = Encoder.generate_batches(indexed_text_inputs, text_input_pc, empty_token_idx)
+
+    distance_delta = tf.constant(5.0, tf.float32)
+
+    # negative_net_out = tf.stop_gradient(negative_net.out)
+    negative_net_out = negative_net.out
+
+    positive_net_out = net.out
+    positive_distance = tf.norm(encoder_out - positive_net_out, axis=1)
+
+    # negative_distance = tf.stop_gradient(tf.norm(encoder_out - negative_net_out))
+    negative_distance = tf.norm(encoder_out - negative_net_out, axis=1)
+
+    # tf.summary.histogram('encoder_out', encoder_out)
+    # tf.summary.histogram('positive_out', positive_net_out)
+    # tf.summary.histogram('negative_out', negative_net_out)
+
+    # loss = positive_distance / (negative_distance + 1e-6)
+
+    loss = positive_distance + distance_delta - negative_distance
+    loss = tf.nn.relu(loss)
+    loss = tf.reduce_mean(loss)
+    tf.summary.scalar('positive', tf.reduce_mean(positive_distance))
+    tf.summary.scalar('negative', tf.reduce_mean(negative_distance))
+    tf.summary.scalar('loss', loss)
+    summaries = tf.summary.merge_all()
+    weights = [
+        var
+        for var in tf.trainable_variables()
+        if len(var.shape) > 1 and var.shape[0] > 1
+           and not var.name.startswith('rnn')
+    ]
+    regularized_weights = [
+        tf.nn.l2_loss(w)
+        for w in weights
+    ]
+    l2_loss = tf.reduce_sum(regularized_weights)
+    # updates = tf.train.AdamOptimizer().minimize(loss + 1e-3 * l2_loss)
+    updates = tf.train.RMSPropOptimizer(
+        learning_rate=0.001,
+        decay=0.1,
+        momentum=0.9,
+        centered=True,
+    ).minimize(loss + 1e-3 * l2_loss)
+
+    validation_code, train_code = split_batches(code_batches, 10)
+    valid_negative, train_negative = split_batches(negative_code_batches, 10)
+    validation_text, train_text = split_batches(text_input_batches, 10)
+
+    initializer = tf.global_variables_initializer()
+    for retry_num in range(1):
+        # plot_axes, plot = new_figure(retry_num, 100, 2)
+        saver = tf.train.Saver(max_to_keep=10)
+        config = tf.ConfigProto()
+        config.graph_options.optimizer_options.global_jit_level = tf.OptimizerOptions.ON_1
+        with tf.Session(config=config) as sess, tf.device('/cpu:0'):
+            summary_writer = tf.summary.FileWriter('models', sess.graph)
+            sess.run(initializer)
+            try:
+                for train_epoch in range(100):
+                    print(f'start epoch {train_epoch}')
+                    res = []
+                    for j, feed in enumerate(make_samples_feed(train_text, train_code, train_negative, 3)):
+                        err, summary, _ = sess.run(fetches=[loss, summaries, updates], feed_dict=feed)
+                        summary_writer.add_summary(summary, train_epoch * 3000 + j)
+                        res.append(float(err))
+                        # if (j + 1) % 50 == 0:
+                        #     print(f'iteration {j}')
+
+                    tr_loss = np.mean(res)
+                    print('valid epoch')
+                    res = []
+                    for j, feed in enumerate(make_samples_feed(validation_text, validation_code, valid_negative, 1)):
+                        err, *_ = sess.run(fetches=[loss], feed_dict=feed)
+                        res.append(float(err))
+
+                    v_loss = np.mean(res)
+
+                    print(f'epoch {train_epoch} train {tr_loss} valid {v_loss}')
+                    saver.save(sess, 'models/model', train_epoch)
+
+                    # update_figure(plot, plot_axes, train_epoch, v_loss, tr_loss)
+            except Exception as ex:
+                print(ex)
+                # print_tb(ex.__traceback__)
+
+
+def tokens_from_code(code):
+    tokens = set()
+    for _code in code:
+        tokens |= {tk.token_type for tk in _code.all_nodes}
+    return list(sorted(tokens))
+
+
+SEQ_START_MARKER = 'SeqStartMarker'
+SEQ_END_MARKER = 'SeqEndMarker'
+
+
+def make_indexed_code(code, tokens):
+    token_idx = {tk: i for i, tk in enumerate(tokens)}
+    token_idx[SEQ_START_MARKER] = len(token_idx)
+    token_idx[SEQ_END_MARKER] = len(token_idx)
+
+    def process_tree(tree, result):
+        result.append(tree.token_type)
+        if tree.children:
+            result.append(SEQ_START_MARKER)
+            for ch in tree.children:
+                process_tree(ch, result)
+            result.append(SEQ_END_MARKER)
+        return result
+
+    code_tree_as_list = [process_tree(it.root_node, []) for it in code]
+    indexed_code = [[token_idx[it] for it in cd] for cd in code_tree_as_list]
+    r_index = {idx: tk for tk, idx in token_idx.items()}
+    return indexed_code, r_index
 
 
 def process_parsed(name):
@@ -783,6 +669,7 @@ def process_parsed(name):
     parsed = parsed[pd.notnull(parsed['answer_code'])]
     inputs = [question + answer for question, answer in zip(parsed['question_text'], parsed['answer_text'])]
     code = [(ast.parse(it), it) for it in parsed['answer_code']]
+
     code_common_names = [extract_common_names(*tree) for tree in code]
 
     attribute_names, function_names = [], []
@@ -793,11 +680,73 @@ def process_parsed(name):
     attribute_names = get_most_common_names(attribute_names)
     function_names = get_most_common_names(function_names)
 
-    renamed_code = [
-        (replace_names(tree, attribute_names, function_names), text)
-        for tree, text in code
+    # renamed_code = [
+    #     (replace_names(tree, attribute_names, function_names), text)
+    #     for tree, text in code
+    # ]
+    renamed_code = code
+
+    transformed_code = [
+        (transform_tree(tree, text), text)
+        for tree, text in renamed_code
     ]
 
+    trees = [tree for tree, _ in transformed_code]
+
+    transformed_code = [
+        replace_empty_tokens(tree)
+        for tree in trees
+    ]
+
+    transformed_code = [
+        children_as_list(tree)
+        for tree in transformed_code
+    ]
+
+    # non_terminals = [find_non_terminals(it) for it, _ in transformed_code]
+    tokens = extract_tokens(transformed_code)
+    code_as_nodes = [convert_to_node(tree) for tree in transformed_code]
+
+    characters = [ch for text in inputs for ch in list(text)]
+    characters = count_items(characters, sort=True)
+    characters = {ch for ch, count in characters if count > 20}
+
+    data_set = [(c, i) for c, i in zip(code_as_nodes, inputs) if c.non_leafs and not set(i) - characters]
+    data_set.sort(key=lambda x: len(x[1]))
+    text_inputs = [text for _, text in data_set]
+    code_inputs = [code for code, _ in data_set]
+
+    characters = list(characters)
+    character_mapping = {ch: i for i, ch in enumerate(sorted(characters))}
+
+    indexed_text_inputs = [
+        [
+            character_mapping[ch]
+            for ch in text_input
+        ]
+        for text_input in text_inputs
+    ]
+
+    num_text_tokens = len(characters)
+    code_tokens = tokens_from_code(code_inputs)
+    indexed_code_inputs, code_tokens_r_index = make_indexed_code(code_inputs, code_tokens)
+    num_code_tokens = len(code_tokens_r_index)
+
+    # literals = [
+    #     literal
+    #     for tree, _ in transformed_code
+    #     for literal in get_constant_literals(tree)
+    # ]
+    #
+    # literals = count_items(literals, sort=True)
+    # literals_bpe = smth_like_bpe.make_bpe(literals)
+
+    # seq2seq_input_check(num_text_tokens, indexed_text_inputs)
+    seq2seq_text2code(indexed_text_inputs, indexed_code_inputs, num_text_tokens, num_code_tokens)
+
+    #
+    # import ipdb
+    # ipdb.set_trace()
     exit(99)
 
 
