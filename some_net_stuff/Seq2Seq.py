@@ -9,6 +9,7 @@ from seq2seq.contrib.seq2seq import helper
 from seq2seq.contrib.seq2seq.helper import CustomHelper
 from seq2seq.graph_module import GraphModule
 from seq2seq.training import utils as training_utils
+from seq2seq.training.utils import cell_from_spec
 from tensorflow.contrib.learn import ModeKeys
 from tensorflow.python.framework import constant_op
 from tensorflow.python.framework import dtypes
@@ -20,7 +21,9 @@ from tensorflow.python.ops import control_flow_ops
 from tensorflow.python.ops import math_ops
 from tensorflow.python.ops import tensor_array_ops
 from tensorflow.python.ops import variable_scope
+from tensorflow.python.ops.rnn_cell_impl import MultiRNNCell
 from tensorflow.python.util import nest
+from tensorflow.python.ops import embedding_ops
 
 
 def _unpack_cell(cell):
@@ -460,8 +463,28 @@ class Decoder(GraphModule, Configurable):
                  name="attention_decoder"):
         GraphModule.__init__(self, name)
         Configurable.__init__(self, params, mode)
-        self.params["rnn_cell"] = _toggle_dropout(self.params["rnn_cell"], mode)
-        self.cell = training_utils.get_rnn_cell(**self.params["rnn_cell"])
+        rnn_params = self.params["rnn_cell"]
+        self.params["rnn_cell"] = _toggle_dropout(rnn_params, mode)
+        dropout_input_keep_prob = rnn_params['dropout_input_keep_prob']
+        dropout_output_keep_prob = rnn_params['dropout_output_keep_prob']
+        cells = []
+        for _ in range(rnn_params['num_layers']):
+            cell = cell_from_spec(rnn_params['cell_class'], rnn_params['cell_params'])
+            if dropout_input_keep_prob < 1.0 or dropout_output_keep_prob < 1.0:
+                cell = tf.contrib.rnn.DropoutWrapper(
+                    cell=cell,
+                    input_keep_prob=dropout_input_keep_prob,
+                    output_keep_prob=dropout_output_keep_prob)
+            cells.append(cell)
+
+        if len(cells) > 1:
+            final_cell = MultiRNNCell(
+                cells=cells,
+                state_is_tuple=False,
+            )
+        else:
+            final_cell = cells[0]
+        self.cell = final_cell
         # Not initialized yet
         self.initial_state = None
         self.helper = None
@@ -517,7 +540,7 @@ class Decoder(GraphModule, Configurable):
             -self.params["init_scale"],
             self.params["init_scale"]))
 
-        maximum_iterations = None
+        maximum_iterations = helper.max_time
         if self.mode == tf.contrib.learn.ModeKeys.INFER:
             maximum_iterations = self.params["max_decode_length"]
 
@@ -659,6 +682,79 @@ class PassThroughBridge(Configurable):
         return {}
 
 
+class GreedyEmbeddingHelper(helper.Helper):
+    """A helper for use during inference.
+
+    Uses the argmax of the output (treated as logits) and passes the
+    result through an embedding layer to get the next input.
+    """
+
+    def __init__(self, embedding, start_tokens, end_token, max_time):
+        """Initializer.
+
+        Args:
+          embedding: A callable that takes a vector tensor of `ids` (argmax ids),
+            or the `params` argument for `embedding_lookup`.
+          start_tokens: `int32` vector shaped `[batch_size]`, the start tokens.
+          end_token: `int32` scalar, the token that marks end of decoding.
+
+        Raises:
+          ValueError: if `sequence_length` is not a 1D tensor.
+        """
+        if callable(embedding):
+            self._embedding_fn = embedding
+        else:
+            self._embedding_fn = (
+                lambda ids: embedding_ops.embedding_lookup(embedding, ids))
+
+        self._start_tokens = ops.convert_to_tensor(
+            start_tokens, dtype=dtypes.int32, name="start_tokens")
+        self._end_token = ops.convert_to_tensor(
+            end_token, dtype=dtypes.int32, name="end_token")
+        if self._start_tokens.get_shape().ndims != 1:
+            raise ValueError("start_tokens must be a vector")
+        self._batch_size = array_ops.size(start_tokens)
+        if self._end_token.get_shape().ndims != 0:
+            raise ValueError("end_token must be a scalar")
+        self._start_inputs = self._embedding_fn(self._start_tokens)
+        self.max_time = max_time
+
+    @property
+    def batch_size(self):
+        return self._batch_size
+
+    def initialize(self, name=None):
+        finished = array_ops.tile([False], [self._batch_size])
+        return finished, self._start_inputs
+
+    def sample(self, time, outputs, state, name=None):
+        """sample for GreedyEmbeddingHelper."""
+        del time, state  # unused by sample_fn
+        # Outputs are logits, use argmax to get the most probable id
+        if not isinstance(outputs, ops.Tensor):
+            raise TypeError("Expected outputs to be a single Tensor, got: %s" %
+                            type(outputs))
+        sample_ids = math_ops.cast(
+            math_ops.argmax(outputs, axis=-1), dtypes.int32)
+        return sample_ids
+
+    def next_inputs(self, time, outputs, state, sample_ids, name=None):
+        """next_inputs_fn for GreedyEmbeddingHelper."""
+        # time_limit_exceed = math_ops.greater(time, self._max_time)
+        finished = math_ops.equal(sample_ids, self._end_token)
+        all_finished = math_ops.reduce_all(finished)
+
+        if self.max_time is not None:
+            all_finished = finished = tf.equal(time, self.max_time)
+        # is_finished = math_ops.logical_or(all_finished, time_limit_exceed)
+        next_inputs = control_flow_ops.cond(
+            all_finished,
+            # If we're finished, the next_inputs value doesn't matter
+            lambda: self._start_inputs,
+            lambda: self._embedding_fn(sample_ids))
+        return finished, next_inputs, state
+
+
 def _total_tensor_depth(tensor):
     """Returns the size of a tensor without the first (batch) dimension"""
     return np.prod(tensor.get_shape().as_list()[1:])
@@ -738,63 +834,79 @@ def get_output_projection_fn(size):
     return output_projection_fn
 
 
-def build_model(batch_size, input_num_tokens, output_num_tokens, is_in_train_mode=True):
+def build_model(batch_size, input_num_tokens, output_num_tokens, is_in_train_mode):
+    mode_key = ModeKeys.TRAIN if is_in_train_mode else ModeKeys.EVAL
     inputs = tf.placeholder(tf.float32, [None, batch_size, input_num_tokens])
     input_length = tf.placeholder(tf.int32, [batch_size])
-    targets = tf.placeholder(tf.float32, [None, batch_size, output_num_tokens])
+    # targets = tf.placeholder(tf.float32, [None, batch_size, output_num_tokens])
     target_labels = tf.placeholder(tf.int32, [None, batch_size])
     target_length = tf.placeholder(tf.int32, [batch_size])
 
-    encoder_params = Encoder.default_params()
-    encoder = Encoder(encoder_params, ModeKeys.TRAIN, 'eeencoder')
-    encoder_output = encoder(inputs, input_length, time_major=True)
+    with variable_scope.variable_scope("Seq2Seq", reuse=tf.AUTO_REUSE):
+        encoder_params = Encoder.default_params()
+        encoder_params['rnn_cell']['num_layers'] = 2
+        encoder = Encoder(encoder_params, mode_key, 'eeencoder')
+        encoder_output = encoder(inputs, input_length, time_major=True)
 
-    bridge_params = InitialStateBridge.default_params()
-    bridge = InitialStateBridge(encoder_output, 128, bridge_params, ModeKeys.TRAIN)
+        attention_params = AttentionLayerDot.default_params()
+        attention = AttentionLayerDot(attention_params, mode_key)
 
-    attention_params = AttentionLayerDot.default_params()
-    attention = AttentionLayerDot(attention_params, ModeKeys.TRAIN)
+        decoder_params = Decoder.default_params()
+        decoder_params['rnn_cell']['num_layers'] = 1
 
-    decoder_params = Decoder.default_params()
-    attention_values = encoder_output.attention_values
-    attention_values_length = encoder_output.attention_values_length
-    attention_keys = encoder_output.outputs
-    decoder = Decoder(
-        params=decoder_params,
-        mode=ModeKeys.TRAIN,
-        vocab_size=output_num_tokens,
-        attention_keys=attention_keys,
-        attention_values=attention_values,
-        attention_values_length=attention_values_length,
-        attention_fn=attention,
-        name='dddecoder',
-    )
-    if is_in_train_mode:
-        _helper = helper.TrainingHelper(
-            inputs=targets,
-            sequence_length=target_length,
-            time_major=True,
+        bridge_params = InitialStateBridge.default_params()
+        decoder_state_size = decoder_params['rnn_cell']['cell_params']['num_units']
+        decoder_state_size *= decoder_params['rnn_cell']['num_layers']
+        bridge = InitialStateBridge(encoder_output, decoder_state_size, bridge_params, mode_key)
+
+        attention_values = encoder_output.attention_values
+        attention_values_length = encoder_output.attention_values_length
+        attention_keys = encoder_output.outputs
+        decoder = Decoder(
+            params=decoder_params,
+            mode=mode_key,
+            vocab_size=output_num_tokens,
+            attention_keys=attention_keys,
+            attention_values=attention_values,
+            attention_values_length=attention_values_length,
+            attention_fn=attention,
+            name='dddecoder',
         )
-    else:
-        _helper = helper.GreedyEmbeddingHelper(
+        # if is_in_train_mode:
+        #     _helper = helper.TrainingHelper(
+        #         inputs=targets,
+        #         sequence_length=target_length,
+        #         time_major=True,
+        #     )
+        # else:
+        _helper = GreedyEmbeddingHelper(
             embedding=get_output_projection_fn(output_num_tokens),
             start_tokens=tf.fill([batch_size], output_num_tokens - 2),
             end_token=output_num_tokens - 1,
+            max_time=tf.reduce_max(target_length),
         )
         targets = None
-    decoder_initial_state = bridge()
-    decoder_output, decoder_final_state = decoder(decoder_initial_state, _helper)
+        decoder_initial_state = bridge()
+        decoder_output, decoder_final_state = decoder(decoder_initial_state, _helper)
 
-    losses = seq2seq_losses.cross_entropy_sequence_loss(
-        logits=decoder_output.logits[:, :, :],
-        targets=target_labels,
-        sequence_length=target_length,
-    )
+        # losses = seq2seq_losses.cross_entropy_sequence_loss(
+        #     logits=decoder_output.logits,
+        #     targets=target_labels,
+        #     sequence_length=target_length,
+        # )
 
-    # Calculate the average log perplexity
-    loss = tf.reduce_sum(losses) / tf.to_float(tf.reduce_sum(target_length))
+        losses = tf.nn.sparse_softmax_cross_entropy_with_logits(
+            logits=decoder_output.logits,
+            labels=target_labels,
+        )
 
-    return inputs, input_length, targets, target_labels, target_length, loss
+        outputs = tf.nn.softmax(decoder_output.logits)
+        outputs = tf.argmax(outputs, axis=-1)
+
+        # Calculate the average log perplexity
+        loss = tf.reduce_sum(losses) / tf.to_float(tf.reduce_sum(target_length))
+
+    return inputs, input_length, targets, target_labels, target_length, outputs, loss
 
 
 if __name__ == '__main__':
