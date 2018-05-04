@@ -2,6 +2,8 @@ import tensorflow as tf
 
 from tensorflow import variable_scope as vs
 
+from utilss import dict_to_object
+
 
 def dynamic_decode(
         decoder_cell,
@@ -74,16 +76,17 @@ def dynamic_decode(
     return final_outputs, final_state
 
 
-def build_model(batch_size, input_num_tokens, output_num_tokens, is_in_train_mode):
-
+def build_model(batch_size, input_num_tokens, code_output_num_tokens, word_output_num_tokens):
     with vs("inputs"):
-        input_ids = tf.placeholder(tf.int32, [None, batch_size])
-        input_weights = tf.placeholder(tf.float32, [None, batch_size])
-        input_length = tf.placeholder(tf.int32, [batch_size])
-        target_labels = tf.placeholder(tf.int32, [None, batch_size])
-        target_length = tf.placeholder(tf.int32, [batch_size])
+        input_ids = tf.placeholder(tf.int32, [None, batch_size], 'input_ids')
+        input_weights = tf.placeholder(tf.float32, [None, batch_size], 'input_weight')
+        input_length = tf.placeholder(tf.int32, [batch_size], 'input_length')
+        code_target_labels = tf.placeholder(tf.int32, [None, batch_size], 'code_outputs')
+        code_target_length = tf.placeholder(tf.int32, [batch_size], 'output_length')
+        word_target_labels = tf.placeholder(tf.int32, [None, batch_size], 'word_outputs')
+        word_target_length = tf.placeholder(tf.int32, [batch_size], 'word_length')
 
-        encoder_input_size = 128
+        encoder_input_size = 256
 
         embedding = tf.get_variable(
             name='input_embedding',
@@ -92,7 +95,8 @@ def build_model(batch_size, input_num_tokens, output_num_tokens, is_in_train_mod
         )
 
         prepared_inputs = tf.nn.embedding_lookup(embedding, input_ids)
-        weighted_inputs = input_weights * prepared_inputs
+        _input_weights = tf.expand_dims(input_weights, axis=2)
+        weighted_inputs = _input_weights * prepared_inputs
 
     with vs("encoder") as encoder_scope:
         encoder_state_size = 128
@@ -118,7 +122,7 @@ def build_model(batch_size, input_num_tokens, output_num_tokens, is_in_train_mod
         # encoder_output, (encoder_state_fw, encoder_state_bw) = tf.nn.bidirectional_dynamic_rnn(
         #     cell_fw=encoder_fw_cell,
         #     cell_bw=encoder_bw_cell,
-        #     inputs=inputs,
+        #     inputs=weighted_inputs,
         #     sequence_length=input_length,
         #     time_major=True,
         #     dtype=tf.float32,
@@ -129,34 +133,71 @@ def build_model(batch_size, input_num_tokens, output_num_tokens, is_in_train_mod
 
         encoder_result = tf.concat([final_encoder_state_fw, final_encoder_state_bw], 1)
 
-    with vs("decoder") as decoder_scope:
+    with vs("code_decoder") as decoder_scope:
         decoder_state_size = encoder_state_size * 2
         decoder_internal_cells = [tf.nn.rnn_cell.GRUCell(decoder_state_size) for _ in range(2)]
         decoder_cell = tf.nn.rnn_cell.MultiRNNCell(decoder_internal_cells)
-        decoder_initial_input = [tf.one_hot(output_num_tokens - 2, output_num_tokens) for _ in range(batch_size)]
-        decoder_initial_input = tf.stack(decoder_initial_input, axis=0)
-        decoder_output, decoder_state = dynamic_decode(
+        decoder_initial_input = tf.zeros([batch_size, code_output_num_tokens], dtype=tf.float32)
+        code_decoder_output, code_decoder_state = dynamic_decode(
             decoder_cell=decoder_cell,
             batch_size=batch_size,
             decoder_initial_input=decoder_initial_input,
             encoder_results=encoder_result,
-            output_size=output_num_tokens,
-            maximum_iterations=tf.reduce_max(target_length),
+            output_size=code_output_num_tokens,
+            maximum_iterations=tf.reduce_max(code_target_length),
+            parallel_iterations=1,
+            scope=decoder_scope,
+        )
+
+    with vs("word_decoder") as decoder_scope:
+        decoder_state_size = encoder_state_size * 2
+        decoder_internal_cells = [tf.nn.rnn_cell.GRUCell(decoder_state_size) for _ in range(1)]
+        decoder_cell = tf.nn.rnn_cell.MultiRNNCell(decoder_internal_cells)
+        decoder_initial_input = tf.zeros([batch_size, word_output_num_tokens], dtype=tf.float32)
+        word_decoder_output, word_decoder_state = dynamic_decode(
+            decoder_cell=decoder_cell,
+            batch_size=batch_size,
+            decoder_initial_input=decoder_initial_input,
+            encoder_results=encoder_result,
+            output_size=word_output_num_tokens,
+            maximum_iterations=tf.reduce_max(word_target_length),
             parallel_iterations=1,
             scope=decoder_scope,
         )
 
     with vs("loss"):
-        losses = tf.nn.sparse_softmax_cross_entropy_with_logits(
-            logits=decoder_output,
-            labels=target_labels,
+        code_losses = tf.nn.sparse_softmax_cross_entropy_with_logits(
+            logits=code_decoder_output,
+            labels=code_target_labels,
         )
 
         # Calculate the average log perplexity
-        loss = tf.reduce_sum(losses) / tf.to_float(tf.reduce_sum(target_length))
+        code_loss = tf.reduce_sum(code_losses) / tf.to_float(tf.reduce_sum(code_target_length))
+
+        word_losses = tf.nn.sparse_softmax_cross_entropy_with_logits(
+            logits=word_decoder_output,
+            labels=word_target_labels,
+        )
+        word_loss = tf.reduce_sum(word_losses) / tf.to_float(tf.reduce_sum(word_target_length))
+
+        loss = code_loss + word_loss
 
     with vs("output"):
-        outputs = tf.nn.softmax(decoder_output)
-        outputs = tf.argmax(outputs, axis=-1)
+        code_outputs = tf.nn.softmax(code_decoder_output)
+        code_outputs = tf.argmax(code_outputs, axis=-1)
 
-    return input_ids, input_length, target_labels, target_length, outputs, loss
+        word_outputs = tf.nn.softmax(word_decoder_output)
+        word_outputs = tf.argmax(word_outputs, axis=-1)
+
+    return dict_to_object({
+        'inputs': input_ids,
+        'input_weight': input_weights,
+        'input_len': input_length,
+        'code_target': code_target_labels,
+        'code_target_len': code_target_length,
+        'word_target': word_target_labels,
+        'word_target_len': word_target_length,
+        'code_outputs': code_outputs,
+        'word_outputs': word_outputs,
+        'loss': loss
+    })
