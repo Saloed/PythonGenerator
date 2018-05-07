@@ -5,7 +5,6 @@ import pandas as pd
 
 from collections import defaultdict
 
-
 COMMON_WORD_COUNT_THRESHOLD = 0
 
 WORD_PLACEHOLDER_TOKEN = '___WORD_PC___'
@@ -177,6 +176,50 @@ def get_indexed_words(data_set_words, index):
     ]
 
 
+class Node:
+
+    def __init__(self, parent, token):
+        self.parent = parent
+        self.token = token
+        self.children = []
+
+
+def sequence_to_tree(sample, seq_end, subtree_start, subtree_end):
+    depth = -1
+    nodes = []
+    for token in sample:
+        if token == seq_end:
+            continue
+        if token == subtree_start:
+            depth += 1
+        elif token == subtree_end:
+            depth -= 1
+        else:
+            nodes.append((depth, token))
+
+    result = []
+
+    def get_node_on_depth(d):
+        i = d
+        res = result
+        while i > 0:
+            res = res[-1][1]
+            i -= 1
+        return res
+
+    for depth, node in nodes:
+        tree = get_node_on_depth(depth)
+        tree.append((node, []))
+
+    return result
+
+
+def convert_ast_to_tree(data_set, index):
+    seq_end = index[SEQUENCE_END_TOKEN]
+    subtree_start, subtree_end = index[SUBTREE_START_TOKEN], index[SUBTREE_END_TOKEN]
+    return [sequence_to_tree(s, seq_end, subtree_start, subtree_end) for s in data_set]
+
+
 def convert_json_content():
     data_set = pd.read_json('django_data_set_str.json')
     converted_data_set = {
@@ -205,6 +248,8 @@ def convert_json_content():
     words_index, words_r_index = get_words_indexes(converted_data_set['words'])
     indexed_words = get_indexed_words(converted_data_set['words'], words_index)
 
+    ast_tree = convert_ast_to_tree(indexed_ast, ast_token_index)
+
     converted_data_set['ast_token_index'] = ast_token_index
     converted_data_set['ast_token_r_index'] = ast_token_r_index
     converted_data_set['indexed_ast'] = indexed_ast
@@ -218,7 +263,9 @@ def convert_json_content():
     converted_data_set['words_r_index'] = words_r_index
     converted_data_set['indexed_words'] = indexed_words
 
-    with open('django_data_set_2.json', 'w') as f:
+    converted_data_set['ast_tree'] = ast_tree
+
+    with open('django_data_set_3.json', 'w') as f:
         json.dump(converted_data_set, f, indent=4)
 
 

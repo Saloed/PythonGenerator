@@ -16,18 +16,18 @@ def compute_rates(root_node: Token):
             compute_rates(child)
 
 
-def prepare_batch(ast: Nodes, emb_indexes):
+def prepare_sample(ast: Nodes, zero_index):
     pc = Placeholders()
     # pc.target = [r_index[ast.root_node.author]]
     compute_rates(ast.root_node)
     ast.non_leafs.sort(key=lambda x: x.index)
     ast.all_nodes.sort(key=lambda x: x.index)
-    pc.root_nodes = [emb_indexes[node.token_type] for node in ast.non_leafs]
-    pc.node_emb = [emb_indexes[node.token_type] for node in ast.all_nodes]
+    pc.root_nodes = [node.token_type for node in ast.non_leafs]
+    pc.node_emb = [node.token_type for node in ast.all_nodes]
     pc.node_left_c = [node.left_rate for node in ast.all_nodes]
     pc.node_right_c = [node.right_rate for node in ast.all_nodes]
     zero_node_index = len(pc.node_emb)
-    pc.node_emb.append(emb_indexes['ZERO_EMB'])
+    pc.node_emb.append(zero_index)
     pc.node_left_c.append(0.0)
     pc.node_right_c.append(0.0)
     max_children_len = max([len(node.children) for node in ast.non_leafs])
@@ -51,6 +51,6 @@ def generate_batches(data_set, emb_indexes, net, dropout):
         d = data_set[ind:ind + BATCH_SIZE]
         feed = {net.dropout: dropout}
         for i in range(BATCH_SIZE):
-            feed.update(pc[i].assign(prepare_batch(d[i], emb_indexes)))
+            feed.update(pc[i].assign(prepare_sample(d[i], emb_indexes)))
         batches.append(feed)
     return batches

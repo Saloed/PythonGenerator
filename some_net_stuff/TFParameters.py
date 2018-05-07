@@ -9,9 +9,9 @@ DROPOUT = 0.8
 # NUM_EMBEDDINGS = 30
 NUM_FEATURES = 30
 NUM_CONVOLUTION = 200
-NUM_HIDDEN = 30
+NUM_HIDDEN = 256
 SAVE_PERIOD = 20
-BATCH_SIZE = 10
+BATCH_SIZE = 6
 NUM_RETRY = 200
 TOKEN_THRESHOLD = 150
 RANDOM_RANGE = 0.02
@@ -40,11 +40,9 @@ def rand_bias(shape, name, params: dict):
     return rand_weight(shape, 1, name, params)
 
 
-def init_params(tokens):
+def init_params(num_tokens):
     with tf.name_scope('Embeddings'):
-        tokens = tokens + ['ZERO_EMB']
-        emb_indexes = {name: i for i, name in enumerate(tokens)}
-        embeddings = tf.Variable(tf.random_uniform((len(emb_indexes), NUM_FEATURES), -1, 1), dtype=tf.float32)
+        embeddings = tf.Variable(tf.random_uniform((num_tokens, NUM_FEATURES), -1, 1), dtype=tf.float32)
 
     with tf.name_scope('Params'):
         weights = {}
@@ -60,7 +58,7 @@ def init_params(tokens):
         rand_bias(NUM_HIDDEN, 'b_hid', bias)
         # rand_bias(author_amount, 'b_out', bias)
 
-    return Params(weights, bias, embeddings), emb_indexes
+    return Params(weights, bias, embeddings)
 
 
 def variable_summaries(var):

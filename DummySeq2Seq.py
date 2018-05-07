@@ -5,6 +5,109 @@ from tensorflow import variable_scope as vs
 from utilss import dict_to_object
 
 
+def compute_alphas(h_t, h_s):
+    _score = tf.matmul(h_t, h_s, transpose_b=True)
+    score = tf.squeeze(_score, [1])
+    alpha_ts = tf.nn.softmax(score)
+    alpha_ts = tf.expand_dims(alpha_ts, 2)
+    return alpha_ts
+
+
+def attention(
+        hidden_state,
+        source_states,
+        attention_vec_size,
+        scope=None
+):
+    with vs(scope or "attention") as varscope:
+        h_s = source_states
+        h_t = tf.expand_dims(hidden_state, 1)
+        alpha_ts = compute_alphas(h_t, h_s)
+        weighted_sources = alpha_ts * h_s
+        context = tf.reduce_sum(weighted_sources, axis=1)
+        combined = tf.concat([context, hidden_state], axis=1)
+        combined_shape = combined.shape[1]
+        W_c = tf.get_variable('W_c', shape=[combined_shape, attention_vec_size], dtype=tf.float32)
+        multiplied = combined @ W_c
+        attention_vec = tf.tanh(multiplied)
+        return attention_vec
+
+
+def get_attention(attention_source, attention_vec_size):
+    def apply_attention(cell, inputs, state, scope):
+        attention_vec = attention(inputs, attention_source, attention_vec_size, scope)
+        return attention_vec, state
+
+    return apply_attention
+
+
+def get_output_projection(output_size):
+    def apply_projection(cell, inputs, state, scope):
+        output_projection_w = tf.get_variable(
+            name='output_projection_w',
+            shape=[cell.output_size, output_size],
+            dtype=tf.float32,
+        )
+        output_projection_b = tf.get_variable(
+            name='output_projection_b',
+            shape=[output_size],
+            dtype=tf.float32,
+        )
+
+        projected_output = tf.nn.relu_layer(inputs, output_projection_w, output_projection_b)
+        return projected_output, state
+
+    return apply_projection
+
+
+class RnnCellProxy:
+
+    def __init__(self, cell, pre_functions=None, post_functions=None):
+        self.__proxy__data__ = {
+            'cell': cell,
+            'pre_fun': pre_functions or [],
+            'post_fun': post_functions or [],
+        }
+
+    def __call__(self, inputs, state, scope=None):
+        cell = self.__proxy__data__['cell']
+        pre_fun = self.__proxy__data__['pre_fun']
+        post_fun = self.__proxy__data__['post_fun']
+        for fun in pre_fun:
+            inputs, state = fun(cell, inputs, state, scope)
+        inputs, state = cell(inputs, state, scope)
+        for fun in post_fun:
+            inputs, state = fun(cell, inputs, state, scope)
+        return inputs, state
+
+    def __getattr__(self, item):
+        if item == '__proxy__data__':
+            return object.__getattribute__(self, '__proxy__data__')
+        return getattr(self.__proxy__data__['cell'], item)
+
+    def __setattr__(self, key, value):
+        if key == '__proxy__data__':
+            return object.__setattr__(self, '__proxy__data__', value)
+        setattr(self.__proxy__data__['cell'], key, value)
+
+
+def get_rnn_cell(
+        num_layers, state_size,
+        output_projection=False, projection_size=None,
+        attention=False, attention_source=None, attention_vec_size=None
+):
+    internal_cells = [tf.nn.rnn_cell.GRUCell(state_size) for _ in range(num_layers)]
+    basic_cell = tf.nn.rnn_cell.MultiRNNCell(internal_cells)
+    post_functions = []
+    if attention and attention_source is not None and attention_vec_size is not None:
+        post_functions.append(get_attention(attention_source, attention_vec_size))
+    if output_projection and projection_size is not None:
+        post_functions.append(get_output_projection(projection_size))
+
+    proxy_cell = RnnCellProxy(basic_cell, post_functions=post_functions)
+    return proxy_cell
+
+
 def dynamic_decode(
         decoder_cell,
         batch_size,
@@ -41,26 +144,13 @@ def dynamic_decode(
             element_shape=[batch_size, output_size]
         )
 
-        output_projection_w = tf.get_variable(
-            name='output_projection_w',
-            shape=[decoder_cell.output_size, output_size],
-            dtype=tf.float32,
-        )
-
-        output_projection_b = tf.get_variable(
-            name='output_projection_b',
-            shape=[output_size],
-            dtype=tf.float32,
-        )
-
         def condition(_time, unused_outputs_ta, unused_state, unused_inputs):
             return _time < maximum_iterations
 
         def body(time, outputs_ta, state, inputs):
             cell_output, cell_state = decoder_cell(inputs, state)
-            projected_output = tf.nn.relu_layer(cell_output, output_projection_w, output_projection_b)
-            outputs_ta = outputs_ta.write(time, projected_output)
-            return time + 1, outputs_ta, cell_state, projected_output
+            outputs_ta = outputs_ta.write(time, cell_output)
+            return time + 1, outputs_ta, cell_state, cell_output
 
         _, final_outputs_ta, final_state, *_ = tf.while_loop(
             condition,
@@ -76,6 +166,29 @@ def dynamic_decode(
     return final_outputs, final_state
 
 
+def build_encoder(input_ids, input_length, input_num_tokens, encoder_input_size, state_size, scope):
+    embedding = tf.get_variable(
+        name='input_embedding',
+        shape=[input_num_tokens, encoder_input_size],
+        dtype=tf.float32
+    )
+
+    prepared_inputs = tf.nn.embedding_lookup(embedding, input_ids)
+    encoder_fw_internal_cells = [tf.nn.rnn_cell.GRUCell(state_size) for _ in range(1)]
+    encoder_bw_internal_cells = [tf.nn.rnn_cell.GRUCell(state_size) for _ in range(1)]
+
+    from tensorflow.contrib.rnn import stack_bidirectional_dynamic_rnn
+    return stack_bidirectional_dynamic_rnn(
+        cells_fw=encoder_fw_internal_cells,
+        cells_bw=encoder_bw_internal_cells,
+        inputs=prepared_inputs,
+        sequence_length=input_length,
+        time_major=True,
+        dtype=tf.float32,
+        scope=scope,
+    )
+
+
 def build_model(batch_size, input_num_tokens, code_output_num_tokens, word_output_num_tokens):
     with vs("inputs"):
         input_ids = tf.placeholder(tf.int32, [None, batch_size], 'input_ids')
@@ -86,33 +199,13 @@ def build_model(batch_size, input_num_tokens, code_output_num_tokens, word_outpu
         word_target_labels = tf.placeholder(tf.int32, [None, batch_size], 'word_outputs')
         word_target_length = tf.placeholder(tf.int32, [batch_size], 'word_length')
 
-        encoder_input_size = 256
-
-        embedding = tf.get_variable(
-            name='input_embedding',
-            shape=[input_num_tokens, encoder_input_size],
-            dtype=tf.float32
-        )
-
-        prepared_inputs = tf.nn.embedding_lookup(embedding, input_ids)
-        _input_weights = tf.expand_dims(input_weights, axis=2)
-        weighted_inputs = _input_weights * prepared_inputs
-
     with vs("encoder") as encoder_scope:
+        encoder_input_size = 256
         encoder_state_size = 128
-        encoder_fw_internal_cells = [tf.nn.rnn_cell.GRUCell(encoder_state_size) for _ in range(2)]
-        encoder_bw_internal_cells = [tf.nn.rnn_cell.GRUCell(encoder_state_size) for _ in range(2)]
-
-        from tensorflow.contrib.rnn import stack_bidirectional_dynamic_rnn
-        encoder_output, encoder_state_fw, encoder_state_bw = stack_bidirectional_dynamic_rnn(
-            cells_fw=encoder_fw_internal_cells,
-            cells_bw=encoder_bw_internal_cells,
-            inputs=weighted_inputs,
-            sequence_length=input_length,
-            time_major=True,
-            dtype=tf.float32,
-            scope=encoder_scope,
+        encoder_output, encoder_state_fw, encoder_state_bw = build_encoder(
+            input_ids, input_length, input_num_tokens, encoder_input_size, encoder_state_size, encoder_scope
         )
+
         final_encoder_state_fw = encoder_state_fw[-1]
         final_encoder_state_bw = encoder_state_bw[-1]
 
@@ -133,10 +226,20 @@ def build_model(batch_size, input_num_tokens, code_output_num_tokens, word_outpu
 
         encoder_result = tf.concat([final_encoder_state_fw, final_encoder_state_bw], 1)
 
+        # [batch_size x time x num_units]
+        attention_source_states = tf.transpose(encoder_output, [1, 0, 2])
+
     with vs("code_decoder") as decoder_scope:
         decoder_state_size = encoder_state_size * 2
-        decoder_internal_cells = [tf.nn.rnn_cell.GRUCell(decoder_state_size) for _ in range(2)]
-        decoder_cell = tf.nn.rnn_cell.MultiRNNCell(decoder_internal_cells)
+        decoder_cell = get_rnn_cell(
+            num_layers=2,
+            state_size=decoder_state_size,
+            output_projection=True,
+            projection_size=code_output_num_tokens,
+            attention=False,
+            attention_source=attention_source_states,
+            attention_vec_size=decoder_state_size,
+        )
         decoder_initial_input = tf.zeros([batch_size, code_output_num_tokens], dtype=tf.float32)
         code_decoder_output, code_decoder_state = dynamic_decode(
             decoder_cell=decoder_cell,
@@ -151,8 +254,15 @@ def build_model(batch_size, input_num_tokens, code_output_num_tokens, word_outpu
 
     with vs("word_decoder") as decoder_scope:
         decoder_state_size = encoder_state_size * 2
-        decoder_internal_cells = [tf.nn.rnn_cell.GRUCell(decoder_state_size) for _ in range(1)]
-        decoder_cell = tf.nn.rnn_cell.MultiRNNCell(decoder_internal_cells)
+        decoder_cell = get_rnn_cell(
+            num_layers=1,
+            state_size=decoder_state_size,
+            output_projection=True,
+            projection_size=word_output_num_tokens,
+            attention=False,
+            attention_source=attention_source_states,
+            attention_vec_size=decoder_state_size,
+        )
         decoder_initial_input = tf.zeros([batch_size, word_output_num_tokens], dtype=tf.float32)
         word_decoder_output, word_decoder_state = dynamic_decode(
             decoder_cell=decoder_cell,
@@ -180,7 +290,12 @@ def build_model(batch_size, input_num_tokens, code_output_num_tokens, word_outpu
         )
         word_loss = tf.reduce_sum(word_losses) / tf.to_float(tf.reduce_sum(word_target_length))
 
-        loss = code_loss + word_loss
+        variables = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES)
+        l2_variables = [v for v in variables if v.name.split('/')[-1].startswith('kernel') or 'projection_w' in v.name]
+        l2_losses = [tf.nn.l2_loss(v) for v in l2_variables]
+        l2_loss = 1e-5 * tf.reduce_sum(l2_losses)
+
+        loss = code_loss + word_loss + l2_loss
 
     with vs("output"):
         code_outputs = tf.nn.softmax(code_decoder_output)
