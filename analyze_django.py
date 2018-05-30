@@ -1,13 +1,20 @@
+import itertools
 import json
-from traceback import print_tb
+import random
 
 import numpy as np
 import tensorflow as tf
 
 import DummySeq2Seq
 
-from analyze_django_prepare import SEQUENCE_END_TOKEN
+from traceback import print_tb
+
+from nltk.translate.bleu_score import sentence_bleu
+
+from analyze_django_prepare import SEQUENCE_END_TOKEN, WORD_PLACEHOLDER_TOKEN
 from utilss import dump_object, load_object
+from net_conf import *
+
 
 DATA_SET_FIELDS = [
     'input',
@@ -47,7 +54,8 @@ def construct_data_set(**kwargs):
     if not kwargs.keys() & set(DATA_SET_FIELDS):
         raise Exception('Incorrect data set')
 
-    return list(zip(*[kwargs[name] for name in DATA_SET_FIELDS]))
+    data_set = list(zip(*[kwargs[name] for name in DATA_SET_FIELDS]))
+    return data_set
 
 
 def preprocess_batch_fn_builder(
@@ -67,11 +75,13 @@ def preprocess_batch_fn_builder(
 def group_by_batches(data_set, batch_size, batch_preprocess_fn):
     batch_count = len(data_set) // batch_size
     batches = []
+    data_set.sort(key=lambda x: len(x[2]))
     for j in range(batch_count):
         ind = j * batch_size
         d = data_set[ind:ind + batch_size]
         processed = batch_preprocess_fn(d)
         batches.append(processed)
+    random.shuffle(batches)
     return batches
 
 
@@ -126,11 +136,20 @@ def replace_time_major(batch):
     return np.asarray(batch).transpose([1, 0])
 
 
-def ungroup_outputs(outputs, targets=None, targets_is_data_set=True, time_major=True):
+def replace_indexes_by_tokens(data, r_index):
+    return [r_index[d] for d in data]
+
+
+def ungroup_outputs(outputs, code_r_index, word_r_index, targets=None, targets_is_data_set=True, time_major=True):
     def ungroup(smth):
         if time_major:
-            smth = [(replace_time_major(code), replace_time_major(words)) for code, words in smth]
-        return [sample for batch in smth for sample in zip(*batch)]
+            smth = ((replace_time_major(code), replace_time_major(words)) for code, words in smth)
+        samples = (sample for batch in smth for sample in zip(*batch))
+        samples = [
+            (replace_indexes_by_tokens(code, code_r_index), replace_indexes_by_tokens(words, word_r_index))
+            for code, words in samples
+        ]
+        return samples
 
     result = ungroup(outputs)
     if targets is not None:
@@ -155,6 +174,8 @@ def eval_model(
         input_end_marker,
         code_output_end_marker,
         word_output_end_marker,
+        code_r_index,
+        word_r_index,
 ):
     batch_preprocess_fn = preprocess_batch_fn_builder(
         input_end_marker, 1.0, code_output_end_marker, word_output_end_marker, time_major=True
@@ -174,7 +195,7 @@ def eval_model(
     saver = tf.train.Saver(max_to_keep=100)
     with tf.Session(config=config) as sess, tf.device('/cpu:0'):
         sess.run(initializer)
-        saver.restore(sess, 'models/model-6')
+        saver.restore(sess, 'models/model-8')
         loss, outputs = run_seq2seq_model(
             data_set=batches,
             model=model,
@@ -183,8 +204,18 @@ def eval_model(
             need_outputs=True,
         )
     print(f'loss {loss}')
-    result = ungroup_outputs(outputs, targets=batches)
+    result = ungroup_outputs(outputs, code_r_index, word_r_index, targets=batches)
+
     dump_object(result, 'model_new_res')
+
+
+def insert_words_into_placeholders(code, words):
+    word_iter = iter(words)
+    result = [
+        c if c != WORD_PLACEHOLDER_TOKEN else next(word_iter, '__NO_WORD__')
+        for c in code
+    ]
+    return result
 
 
 def compare_outputs_and_targets(outputs, target, target_len):
@@ -193,7 +224,13 @@ def compare_outputs_and_targets(outputs, target, target_len):
     code_targets, word_targets = target
     real_code_outputs, real_code_targets = code_outputs[:code_len], code_targets[:code_len]
     real_word_outputs, real_word_targets = word_outputs[:words_len], word_targets[:words_len]
-
+    combined = insert_words_into_placeholders(code_outputs, word_outputs)
+    combined_targets = insert_words_into_placeholders(code_targets, word_targets)
+    real_combined = insert_words_into_placeholders(real_code_outputs, real_word_outputs)
+    real_combined_targets = insert_words_into_placeholders(real_code_targets, real_word_targets)
+    code_bleu = sentence_bleu([combined_targets], combined)
+    _real_combined = list(itertools.takewhile(lambda x: x != SEQUENCE_END_TOKEN, combined)) + [SEQUENCE_END_TOKEN]
+    real_code_bleu = sentence_bleu([real_combined_targets], _real_combined)
     return {
         'all_code_seq': sum(o == t for o, t in zip(code_outputs, code_targets)),
         'code_seq_len': len(code_targets),
@@ -203,6 +240,12 @@ def compare_outputs_and_targets(outputs, target, target_len):
         'word_seq_len': len(word_targets),
         'real_word_seq': sum(o == t for o, t in zip(real_word_outputs, real_word_targets)),
         'word_real_len': words_len,
+        'code':  sum(o == t for o, t in zip(combined, combined_targets)),
+        'code_len': len(combined_targets),
+        'real_code': sum(o == t for o, t in zip(real_combined, real_combined_targets)),
+        'read_code_len': code_len,
+        'code_bleu': code_bleu,
+        'real_code_bleu': real_code_bleu,
     }
 
 
@@ -210,7 +253,8 @@ def lookup_eval_result():
     result = load_object('model_new_res')
     outputs, targets, target_length = result
     stats = [
-        compare_outputs_and_targets(out, tar, tar_len) for out, tar, tar_len in zip(outputs, targets, target_length)
+        compare_outputs_and_targets(out, tar, tar_len)
+        for out, tar, tar_len in zip(outputs, targets, target_length)
     ]
 
     all_code_seq_percents = [st['all_code_seq'] / st['code_seq_len'] for st in stats]
@@ -219,8 +263,16 @@ def lookup_eval_result():
     all_word_seq_percents = [st['all_word_seq'] / st['word_seq_len'] for st in stats]
     real_word_seq_percents = [st['real_word_seq'] / st['word_real_len'] for st in stats]
 
+    code_percents = [st['code'] / st['code_len'] for st in stats]
+    real_code_percents = [st['real_code'] / st['read_code_len'] for st in stats]
+
+    code_bleu = [st['code_bleu'] for st in stats]
+    real_code_bleu = [st['real_code_bleu'] for st in stats]
+
     print(f'code: all {np.mean(all_code_seq_percents)} real {np.mean(real_code_seq_percents)}')
     print(f'words: all {np.mean(all_word_seq_percents)} real {np.mean(real_word_seq_percents)}')
+    print(f'combined: all {np.mean(code_percents)} real {np.mean(real_code_percents)}')
+    print(f'bleu: all {np.mean(code_bleu)} real {np.mean(real_code_bleu)}')
 
 
 def build_loss_summary(model):
@@ -229,9 +281,9 @@ def build_loss_summary(model):
 
 
 def build_updates(model):
-    loss = model.loss
+    loss = model.loss_with_l2
     # return tf.train.RMSPropOptimizer(0.003).minimize(loss)
-    return tf.train.AdamOptimizer().minimize(loss)
+    return tf.train.AdamOptimizer(0.0005).minimize(loss)
 
 
 def train_model(
@@ -271,7 +323,8 @@ def train_model(
     with tf.Session(config=config) as sess, tf.device('/cpu:0'):
         summary_writer = tf.summary.FileWriter('models', sess.graph)
         sess.run(initializer)
-        encoder_variables_restorer.restore(sess, 'models/pretrain-4')
+        encoder_variables_restorer.restore(sess, 'pretrained/pretrain_{}_{}_{}'.format(
+            ENCODER_INPUT_SIZE, ENCODER_STATE_SIZE, ENCODER_LAYERS))
         try:
             for train_epoch in range(100):
                 print(f'start epoch {train_epoch}')
@@ -306,6 +359,10 @@ def filter_big_sequences(data_set):
     return [d for d in data_set if len(d[0]) < 200]
 
 
+def fix_r_index_keys(r_index):
+    return {int(key): value for key, value in r_index.items()}
+
+
 def analyze(train):
     with open('django_data_set_3.json') as f:
         data_set = json.load(f)
@@ -326,6 +383,7 @@ def analyze(train):
     num_word_tokens = len(data_set['words_index'])
 
     print(len(train_set), len(valid_set), num_ast_tokens, num_description_tokens, num_word_tokens)
+
     if train:
         train_model(
             train_data_set=train_set,
@@ -346,10 +404,12 @@ def analyze(train):
             code_output_end_marker=data_set['ast_token_index'][SEQUENCE_END_TOKEN],
             num_word_output_tokens=num_word_tokens,
             word_output_end_marker=data_set['words_index'][SEQUENCE_END_TOKEN],
+            code_r_index=fix_r_index_keys(data_set['ast_token_r_index']),
+            word_r_index=fix_r_index_keys(data_set['words_r_index']),
         )
 
 
 if __name__ == '__main__':
-    # analyze(True)
+    analyze(True)
     # analyze(False)
-    lookup_eval_result()
+    # lookup_eval_result()

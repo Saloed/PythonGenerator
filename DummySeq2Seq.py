@@ -3,6 +3,7 @@ import tensorflow as tf
 from tensorflow import variable_scope as vs
 
 from utilss import dict_to_object
+from net_conf import *
 
 
 def compute_alphas(h_t, h_s):
@@ -166,7 +167,7 @@ def dynamic_decode(
     return final_outputs, final_state
 
 
-def build_encoder(input_ids, input_length, input_num_tokens, encoder_input_size, state_size, scope):
+def build_encoder(input_ids, input_length, input_num_tokens, encoder_input_size, state_size, layers, scope):
     embedding = tf.get_variable(
         name='input_embedding',
         shape=[input_num_tokens, encoder_input_size],
@@ -174,8 +175,8 @@ def build_encoder(input_ids, input_length, input_num_tokens, encoder_input_size,
     )
 
     prepared_inputs = tf.nn.embedding_lookup(embedding, input_ids)
-    encoder_fw_internal_cells = [tf.nn.rnn_cell.GRUCell(state_size) for _ in range(1)]
-    encoder_bw_internal_cells = [tf.nn.rnn_cell.GRUCell(state_size) for _ in range(1)]
+    encoder_fw_internal_cells = [tf.nn.rnn_cell.GRUCell(state_size) for _ in range(layers)]
+    encoder_bw_internal_cells = [tf.nn.rnn_cell.GRUCell(state_size) for _ in range(layers)]
 
     from tensorflow.contrib.rnn import stack_bidirectional_dynamic_rnn
     return stack_bidirectional_dynamic_rnn(
@@ -200,10 +201,9 @@ def build_model(batch_size, input_num_tokens, code_output_num_tokens, word_outpu
         word_target_length = tf.placeholder(tf.int32, [batch_size], 'word_length')
 
     with vs("encoder") as encoder_scope:
-        encoder_input_size = 256
-        encoder_state_size = 128
         encoder_output, encoder_state_fw, encoder_state_bw = build_encoder(
-            input_ids, input_length, input_num_tokens, encoder_input_size, encoder_state_size, encoder_scope
+            input_ids, input_length, input_num_tokens, ENCODER_INPUT_SIZE, ENCODER_STATE_SIZE,
+            ENCODER_LAYERS, encoder_scope
         )
 
         final_encoder_state_fw = encoder_state_fw[-1]
@@ -230,9 +230,9 @@ def build_model(batch_size, input_num_tokens, code_output_num_tokens, word_outpu
         attention_source_states = tf.transpose(encoder_output, [1, 0, 2])
 
     with vs("code_decoder") as decoder_scope:
-        decoder_state_size = encoder_state_size * 2
+        decoder_state_size = ENCODER_STATE_SIZE * 2
         decoder_cell = get_rnn_cell(
-            num_layers=2,
+            num_layers=CODE_DECODER_LAYERS,
             state_size=decoder_state_size,
             output_projection=True,
             projection_size=code_output_num_tokens,
@@ -253,13 +253,13 @@ def build_model(batch_size, input_num_tokens, code_output_num_tokens, word_outpu
         )
 
     with vs("word_decoder") as decoder_scope:
-        decoder_state_size = encoder_state_size * 2
+        decoder_state_size = ENCODER_STATE_SIZE * 2
         decoder_cell = get_rnn_cell(
-            num_layers=1,
+            num_layers=WORD_DECODER_LAYERS,
             state_size=decoder_state_size,
             output_projection=True,
             projection_size=word_output_num_tokens,
-            attention=False,
+            attention=WORD_DECODER_ATTENTION,
             attention_source=attention_source_states,
             attention_vec_size=decoder_state_size,
         )
@@ -293,9 +293,10 @@ def build_model(batch_size, input_num_tokens, code_output_num_tokens, word_outpu
         variables = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES)
         l2_variables = [v for v in variables if v.name.split('/')[-1].startswith('kernel') or 'projection_w' in v.name]
         l2_losses = [tf.nn.l2_loss(v) for v in l2_variables]
-        l2_loss = 1e-5 * tf.reduce_sum(l2_losses)
+        l2_loss = 1e-6 * tf.reduce_sum(l2_losses)
 
-        loss = code_loss + word_loss + l2_loss
+        loss = code_loss + word_loss
+        loss_with_l2 = loss + l2_loss
 
     with vs("output"):
         code_outputs = tf.nn.softmax(code_decoder_output)
@@ -314,5 +315,6 @@ def build_model(batch_size, input_num_tokens, code_output_num_tokens, word_outpu
         'word_target_len': word_target_length,
         'code_outputs': code_outputs,
         'word_outputs': word_outputs,
-        'loss': loss
+        'loss': loss,
+        'loss_with_l2': loss_with_l2,
     })

@@ -2,7 +2,6 @@ import functools
 import sys
 import ast
 import html
-import random
 import re
 import _pickle as P
 
@@ -10,19 +9,15 @@ import timeout_decorator as td
 import pandas as pd
 import numpy as np
 import tensorflow as tf
-from tensorflow.python import debug as tf_debug
-
 
 import DummySeq2Seq
-import spizjenno_runner
-import tree_transformers
+from hlam import tree_transformers
 
 from collections import defaultdict
 from traceback import print_tb
 from multiprocessing import Pool
 
-from tree_transformers import CONSTANT_LITERAL_TYPE
-from some_net import convert_to_node
+from hlam.tree_transformers import CONSTANT_LITERAL_TYPE
 
 
 # from some_net_stuff import Seq2Seq

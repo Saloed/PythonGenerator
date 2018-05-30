@@ -80,7 +80,7 @@ def train(data_set, description_num_tokens, code_num_tokens, input_end_marker):
         input_length = tf.placeholder(tf.int32, [BATCH_SIZE], 'input_len')
 
         encoder_output, encoder_state_fw, encoder_state_bw = build_encoder(
-            input_ids, input_length, description_num_tokens, 256, 128, e_scope
+            input_ids, input_length, description_num_tokens, 128, 64, 1, e_scope
         )
         final_encoder_state_fw = encoder_state_fw[-1]
         final_encoder_state_bw = encoder_state_bw[-1]
@@ -119,7 +119,7 @@ def train(data_set, description_num_tokens, code_num_tokens, input_end_marker):
                     encoder_pc={'inputs': input_ids, 'input_len': input_length},
                     code_pc=code_analyzer.placeholders,
                 )
-                saver.save(sess, 'models/pretrain', train_epoch)
+                saver.save(sess, 'models/pretrain_128_64_1', train_epoch)
                 print(f'epoch {train_epoch} train {tr_loss}')
 
         except Exception as ex:
