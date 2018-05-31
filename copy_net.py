@@ -3,6 +3,8 @@ import collections
 import tensorflow as tf
 from tensorflow.contrib.framework.python.framework import tensor_util
 
+import utilss
+
 
 class CopyNetWrapperState(
     collections.namedtuple("CopyNetWrapperState", ("cell_state", "last_ids", "prob_c"))
@@ -40,8 +42,8 @@ class CopyNetWrapper(tf.nn.rnn_cell.RNNCell):
         self._vocab_size = vocab_size
         self._gen_vocab_size = gen_vocab_size or vocab_size
 
-        self._encoder_input_ids = encoder_input_ids
-        self._encoder_states = encoder_states
+        self._encoder_input_ids = tf.transpose(encoder_input_ids, [1, 0])
+        self._encoder_states = tf.transpose(encoder_states, [1, 0, 2])
         if encoder_state_size is None:
             encoder_state_size = self._encoder_states.shape[-1].value
             if encoder_state_size is None:
@@ -62,20 +64,29 @@ class CopyNetWrapper(tf.nn.rnn_cell.RNNCell):
 
         mask = tf.cast(tf.equal(tf.expand_dims(last_ids, 1), self._encoder_input_ids), tf.float32)
         mask_sum = tf.reduce_sum(mask, axis=1)
-        mask = tf.where(tf.less(mask_sum, 1e-7), mask, mask / tf.expand_dims(mask_sum, 1))
+        condition = tf.less(mask_sum, 1e-7)
+        normalized_mask = mask / tf.expand_dims(mask_sum, 1)
+
+        # condition = utilss.print_shape(condition, 'condition')
+        # mask = utilss.print_shape(mask, 'mask')
+        # normalized_mask = utilss.print_shape(normalized_mask, 'norm mask')
+        # prob_c = utilss.print_shape(prob_c, 'prob c')
+
+        mask = tf.where(condition, mask, normalized_mask, name='select_mask')
         rou = mask * prob_c
-        selective_read = tf.einsum("ijk,ij->ik", self._encoder_states, rou)
+        selective_read = tf.einsum("ijk,ij->ik", self._encoder_states, rou, name='einsum_selective_input')
         inputs = tf.concat([inputs, selective_read], 1)
 
         outputs, cell_state = self._cell(inputs, cell_state, scope)
         generate_score = self._projection(outputs)
 
-        copy_score = tf.einsum("ijk,km->ijm", self._encoder_states, self._copy_weight)
+        copy_score = tf.einsum("ijk,km->ijm", self._encoder_states, self._copy_weight, name='einsum_copy_score')
         copy_score = tf.nn.tanh(copy_score)
 
-        copy_score = tf.einsum("ijm,im->ij", copy_score, outputs)
-        encoder_input_mask = tf.one_hot(self._encoder_input_ids, self._vocab_size)
-        expanded_copy_score = tf.einsum("ijn,ij->ij", encoder_input_mask, copy_score)
+        copy_score = tf.einsum("ijm,im->ij", copy_score, outputs, name='einsum_copy_score_2')
+
+        expand_mask = tf.cast(tf.greater_equal(self._encoder_input_ids, 0), tf.float32)
+        expanded_copy_score = expand_mask * copy_score
 
         prob_g = generate_score
         prob_c = expanded_copy_score
@@ -84,7 +95,8 @@ class CopyNetWrapper(tf.nn.rnn_cell.RNNCell):
         #        prob_g = probs[:, :self._gen_vocab_size]
         #        prob_c = probs[:, self._gen_vocab_size:]
 
-        prob_c_one_hot = tf.einsum("ijn,ij->in", encoder_input_mask, prob_c)
+        encoder_input_mask = tf.one_hot(self._encoder_input_ids, self._vocab_size)
+        prob_c_one_hot = tf.einsum("ijn,ij->in", encoder_input_mask, prob_c, name='einsum_prob_c_one_hot')
         prob_g_total = tf.pad(prob_g, [[0, 0], [0, self._vocab_size - self._gen_vocab_size]])
         outputs = prob_c_one_hot + prob_g_total
         last_ids = tf.argmax(outputs, axis=-1, output_type=tf.int32)

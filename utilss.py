@@ -1,4 +1,5 @@
 import _pickle as P
+import tensorflow as tf
 
 
 def dump_object(obj, name):
@@ -18,3 +19,7 @@ class Struct:
 
 def dict_to_object(_dict):
     return Struct(**_dict)
+
+
+def print_shape(tensor, name):
+    return tf.Print(tensor, [tf.shape(tensor)], name + ' ')

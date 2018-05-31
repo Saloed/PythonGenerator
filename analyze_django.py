@@ -15,7 +15,6 @@ from analyze_django_prepare import SEQUENCE_END_TOKEN, WORD_PLACEHOLDER_TOKEN
 from utilss import dump_object, load_object
 from net_conf import *
 
-
 DATA_SET_FIELDS = [
     'input',
     'input_weight',
@@ -58,8 +57,13 @@ def construct_data_set(**kwargs):
     return data_set
 
 
+def make_copy_words(input, copy_word_mapping):
+    input, _ = input
+    return np.asarray([[copy_word_mapping.get(word, -1) for word in smt] for smt in input])
+
+
 def preprocess_batch_fn_builder(
-        input_end_marker, input_end_weight, code_tar_end_marker, word_tar_end_marker, time_major=True
+        input_end_marker, input_end_weight, code_tar_end_marker, word_tar_end_marker, copy_word_mapping, time_major=True
 ):
     def preprocess_batch(batch):
         input, input_weight, code_tar, word_tar = destruct_data_set(batch)
@@ -67,7 +71,8 @@ def preprocess_batch_fn_builder(
         input_weight = align_batch(input_weight, input_end_weight, time_major)
         code_tar = align_batch(code_tar, code_tar_end_marker, time_major)
         word_tar = align_batch(word_tar, word_tar_end_marker, time_major)
-        return input, input_weight, code_tar, word_tar
+        copy_words = make_copy_words(input, copy_word_mapping)
+        return input, input_weight, copy_words, code_tar, word_tar
 
     return preprocess_batch
 
@@ -86,7 +91,8 @@ def group_by_batches(data_set, batch_size, batch_preprocess_fn):
 
 
 def make_feed_from_data_set(data_set, model):
-    for (inputs, inputs_length), (input_weight, _), (code_tar, code_tar_len), (word_tar, word_tar_len) in data_set:
+    for (inputs, inputs_length), (input_weight, _), copy_words, (code_tar, code_tar_len), (word_tar, word_tar_len) \
+            in data_set:
         yield {
             model.inputs: inputs,
             model.input_len: inputs_length,
@@ -95,6 +101,7 @@ def make_feed_from_data_set(data_set, model):
             model.code_target_len: code_tar_len,
             model.word_target: word_tar,
             model.word_target_len: word_tar_len,
+            model.copyable_input_ids: copy_words,
         }
 
 
@@ -171,6 +178,8 @@ def eval_model(
         num_input_tokens,
         num_code_output_tokens,
         num_word_output_tokens,
+        num_word_output_generated_tokens,
+        copy_word_mapping,
         input_end_marker,
         code_output_end_marker,
         word_output_end_marker,
@@ -178,7 +187,7 @@ def eval_model(
         word_r_index,
 ):
     batch_preprocess_fn = preprocess_batch_fn_builder(
-        input_end_marker, 1.0, code_output_end_marker, word_output_end_marker, time_major=True
+        input_end_marker, 1.0, code_output_end_marker, word_output_end_marker, copy_word_mapping, time_major=True
     )
     batches = group_by_batches(data_set, BATCH_SIZE, batch_preprocess_fn)
     model = DummySeq2Seq.build_model(
@@ -186,6 +195,7 @@ def eval_model(
         num_input_tokens,
         num_code_output_tokens,
         num_word_output_tokens,
+        num_word_output_generated_tokens,
     )
 
     config = tf.ConfigProto()
@@ -240,7 +250,7 @@ def compare_outputs_and_targets(outputs, target, target_len):
         'word_seq_len': len(word_targets),
         'real_word_seq': sum(o == t for o, t in zip(real_word_outputs, real_word_targets)),
         'word_real_len': words_len,
-        'code':  sum(o == t for o, t in zip(combined, combined_targets)),
+        'code': sum(o == t for o, t in zip(combined, combined_targets)),
         'code_len': len(combined_targets),
         'real_code': sum(o == t for o, t in zip(real_combined, real_combined_targets)),
         'read_code_len': code_len,
@@ -292,12 +302,14 @@ def train_model(
         num_input_tokens,
         num_code_output_tokens,
         num_word_output_tokens,
+        num_word_output_generated_tokens,
+        copy_word_mapping,
         input_end_marker,
         code_output_end_marker,
         word_output_end_marker,
 ):
     batch_preprocess_fn = preprocess_batch_fn_builder(
-        input_end_marker, 1.0, code_output_end_marker, word_output_end_marker, time_major=True
+        input_end_marker, 1.0, code_output_end_marker, word_output_end_marker, copy_word_mapping, time_major=True
     )
     train_batches = group_by_batches(train_data_set, BATCH_SIZE, batch_preprocess_fn)
     valid_batches = group_by_batches(valid_data_set, BATCH_SIZE, batch_preprocess_fn)
@@ -307,6 +319,7 @@ def train_model(
         num_input_tokens,
         num_code_output_tokens,
         num_word_output_tokens,
+        num_word_output_generated_tokens,
     )
     encoder_variables = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='encoder')
 
@@ -363,6 +376,15 @@ def fix_r_index_keys(r_index):
     return {int(key): value for key, value in r_index.items()}
 
 
+def get_copy_words(description_idx, words_idx, train_set):
+    *_, word_tar = destruct_data_set(train_set)
+    train_word_ids = {word_id for sample in word_tar for word_id in sample}
+    train_words_idx = {key: value for key, value in words_idx.items() if value in train_word_ids}
+    similar_words = (description_idx.keys() & train_words_idx.keys()) - {SEQUENCE_END_TOKEN}
+    mapping = {description_idx[key]: words_idx[key] for key in similar_words}
+    return mapping
+
+
 def analyze(train):
     with open('django_data_set_3.json') as f:
         data_set = json.load(f)
@@ -378,11 +400,14 @@ def analyze(train):
 
     valid_set, train_set = split_data_set(10, constructed_data_set)
 
+    copy_word_mapping = get_copy_words(data_set['desc_word_index'], data_set['words_index'], train_set)
+
     num_ast_tokens = len(data_set['ast_token_index'])
     num_description_tokens = len(data_set['desc_word_index'])
     num_word_tokens = len(data_set['words_index'])
+    num_generated_words = num_word_tokens - len(copy_word_mapping)
 
-    print(len(train_set), len(valid_set), num_ast_tokens, num_description_tokens, num_word_tokens)
+    print(len(train_set), len(valid_set), num_ast_tokens, num_description_tokens, num_word_tokens, num_generated_words)
 
     if train:
         train_model(
@@ -393,6 +418,8 @@ def analyze(train):
             num_code_output_tokens=num_ast_tokens,
             code_output_end_marker=data_set['ast_token_index'][SEQUENCE_END_TOKEN],
             num_word_output_tokens=num_word_tokens,
+            num_word_output_generated_tokens=num_generated_words,
+            copy_word_mapping=copy_word_mapping,
             word_output_end_marker=data_set['words_index'][SEQUENCE_END_TOKEN],
         )
     else:
@@ -403,6 +430,8 @@ def analyze(train):
             num_code_output_tokens=num_ast_tokens,
             code_output_end_marker=data_set['ast_token_index'][SEQUENCE_END_TOKEN],
             num_word_output_tokens=num_word_tokens,
+            num_word_output_generated_tokens=num_generated_words,
+            copy_word_mapping=copy_word_mapping,
             word_output_end_marker=data_set['words_index'][SEQUENCE_END_TOKEN],
             code_r_index=fix_r_index_keys(data_set['ast_token_r_index']),
             word_r_index=fix_r_index_keys(data_set['words_r_index']),

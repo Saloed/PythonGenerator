@@ -2,6 +2,7 @@ import tensorflow as tf
 
 from tensorflow import variable_scope as vs
 
+import copy_net
 from utilss import dict_to_object
 from net_conf import *
 
@@ -110,15 +111,9 @@ def get_rnn_cell(
 
 
 def dynamic_decode(
-        decoder_cell,
-        batch_size,
-        encoder_results,
-        decoder_initial_input,
-        output_size,
-        maximum_iterations=None,
-        parallel_iterations=32,
-        swap_memory=False,
-        scope=None
+    decoder_cell, batch_size, decoder_initial_input, output_size,
+    decoder_initial_state,
+    maximum_iterations=None, parallel_iterations=32, swap_memory=False, scope=None
 ):
     with vs(scope or "decoder") as varscope:
         # Properly cache variable values inside the while_loop
@@ -133,9 +128,12 @@ def dynamic_decode(
 
         initial_time = tf.constant(0, dtype=tf.int32)
 
-        initial_state = list(decoder_cell.zero_state(batch_size, tf.float32))
-        initial_state[0] = encoder_results
-        initial_state = tuple(initial_state)
+        initial_state = decoder_cell.zero_state(batch_size, tf.float32)
+
+        if decoder_initial_state is not None:
+            initial_state = list(initial_state)
+            initial_state[0] = decoder_initial_state
+            initial_state = tuple(initial_state)
 
         initial_inputs = decoder_initial_input
 
@@ -190,7 +188,10 @@ def build_encoder(input_ids, input_length, input_num_tokens, encoder_input_size,
     )
 
 
-def build_model(batch_size, input_num_tokens, code_output_num_tokens, word_output_num_tokens):
+def build_model(
+    batch_size, input_num_tokens, code_output_num_tokens, word_output_num_tokens,
+    word_output_num_generated_tokens
+):
     with vs("inputs"):
         input_ids = tf.placeholder(tf.int32, [None, batch_size], 'input_ids')
         input_weights = tf.placeholder(tf.float32, [None, batch_size], 'input_weight')
@@ -199,6 +200,8 @@ def build_model(batch_size, input_num_tokens, code_output_num_tokens, word_outpu
         code_target_length = tf.placeholder(tf.int32, [batch_size], 'output_length')
         word_target_labels = tf.placeholder(tf.int32, [None, batch_size], 'word_outputs')
         word_target_length = tf.placeholder(tf.int32, [batch_size], 'word_length')
+
+        copyable_input_ids = tf.placeholder(tf.int32, [None, batch_size], 'copyable_input_ids')
 
     with vs("encoder") as encoder_scope:
         encoder_output, encoder_state_fw, encoder_state_bw = build_encoder(
@@ -242,38 +245,50 @@ def build_model(batch_size, input_num_tokens, code_output_num_tokens, word_outpu
         )
         decoder_initial_input = tf.zeros([batch_size, code_output_num_tokens], dtype=tf.float32)
         code_decoder_output, code_decoder_state = dynamic_decode(
-            decoder_cell=decoder_cell,
-            batch_size=batch_size,
+            decoder_cell=decoder_cell, batch_size=batch_size,
+            decoder_initial_state=encoder_result,
             decoder_initial_input=decoder_initial_input,
-            encoder_results=encoder_result,
             output_size=code_output_num_tokens,
             maximum_iterations=tf.reduce_max(code_target_length),
-            parallel_iterations=1,
-            scope=decoder_scope,
-        )
+            parallel_iterations=1, scope=decoder_scope)
 
     with vs("word_decoder") as decoder_scope:
         decoder_state_size = ENCODER_STATE_SIZE * 2
-        decoder_cell = get_rnn_cell(
-            num_layers=WORD_DECODER_LAYERS,
-            state_size=decoder_state_size,
-            output_projection=True,
-            projection_size=word_output_num_tokens,
-            attention=WORD_DECODER_ATTENTION,
-            attention_source=attention_source_states,
-            attention_vec_size=decoder_state_size,
-        )
+        if WORD_COPY_NET:
+            internal_cells = [tf.nn.rnn_cell.GRUCell(decoder_state_size) for _ in range(WORD_DECODER_LAYERS)]
+            basic_cell = tf.nn.rnn_cell.MultiRNNCell(internal_cells)
+            initial_state = basic_cell.zero_state(batch_size, tf.float32)
+            initial_state = list(initial_state)
+            initial_state[0] = encoder_result
+            initial_state = tuple(initial_state)
+            decoder_cell = copy_net.CopyNetWrapper(
+                cell=basic_cell,
+                encoder_states=encoder_output,
+                encoder_input_ids=copyable_input_ids,
+                vocab_size=word_output_num_tokens,
+                gen_vocab_size=word_output_num_generated_tokens,
+                initial_cell_state=initial_state
+            )
+            decoder_initial_state = None
+        else:
+            decoder_cell = get_rnn_cell(
+                num_layers=WORD_DECODER_LAYERS,
+                state_size=decoder_state_size,
+                output_projection=True,
+                projection_size=word_output_num_tokens,
+                attention=WORD_DECODER_ATTENTION,
+                attention_source=attention_source_states,
+                attention_vec_size=decoder_state_size,
+            )
+            decoder_initial_state = encoder_result
         decoder_initial_input = tf.zeros([batch_size, word_output_num_tokens], dtype=tf.float32)
         word_decoder_output, word_decoder_state = dynamic_decode(
-            decoder_cell=decoder_cell,
-            batch_size=batch_size,
+            decoder_cell=decoder_cell, batch_size=batch_size,
+            decoder_initial_state=decoder_initial_state,
             decoder_initial_input=decoder_initial_input,
-            encoder_results=encoder_result,
             output_size=word_output_num_tokens,
             maximum_iterations=tf.reduce_max(word_target_length),
-            parallel_iterations=1,
-            scope=decoder_scope,
-        )
+            parallel_iterations=1, scope=decoder_scope)
 
     with vs("loss"):
         code_losses = tf.nn.sparse_softmax_cross_entropy_with_logits(
@@ -309,6 +324,7 @@ def build_model(batch_size, input_num_tokens, code_output_num_tokens, word_outpu
         'inputs': input_ids,
         'input_weight': input_weights,
         'input_len': input_length,
+        'copyable_input_ids': copyable_input_ids,
         'code_target': code_target_labels,
         'code_target_len': code_target_length,
         'word_target': word_target_labels,
