@@ -7,6 +7,9 @@ from utilss import dict_to_object
 from net_conf import *
 
 
+# from results.model_9_net_conf import *
+
+
 def compute_alphas(h_t, h_s):
     _score = tf.matmul(h_t, h_s, transpose_b=True)
     score = tf.squeeze(_score, [1])
@@ -94,12 +97,13 @@ class RnnCellProxy:
 
 
 def get_rnn_cell(
-        num_layers, state_size,
+        num_layers, state_size, dropout_prob,
         output_projection=False, projection_size=None,
         attention=False, attention_source=None, attention_vec_size=None
 ):
     internal_cells = [tf.nn.rnn_cell.GRUCell(state_size) for _ in range(num_layers)]
     basic_cell = tf.nn.rnn_cell.MultiRNNCell(internal_cells)
+    basic_cell = tf.nn.rnn_cell.DropoutWrapper(basic_cell, output_keep_prob=dropout_prob, state_keep_prob=dropout_prob)
     post_functions = []
     if attention and attention_source is not None and attention_vec_size is not None:
         post_functions.append(get_attention(attention_source, attention_vec_size))
@@ -111,9 +115,9 @@ def get_rnn_cell(
 
 
 def dynamic_decode(
-    decoder_cell, batch_size, decoder_initial_input, output_size,
-    decoder_initial_state,
-    maximum_iterations=None, parallel_iterations=32, swap_memory=False, scope=None
+        decoder_cell, batch_size, decoder_initial_input, output_size,
+        decoder_initial_state,
+        maximum_iterations=None, parallel_iterations=32, swap_memory=False, scope=None
 ):
     with vs(scope or "decoder") as varscope:
         # Properly cache variable values inside the while_loop
@@ -165,7 +169,8 @@ def dynamic_decode(
     return final_outputs, final_state
 
 
-def build_encoder(input_ids, input_length, input_num_tokens, encoder_input_size, state_size, layers, scope):
+def build_encoder(input_ids, input_length, input_num_tokens, encoder_input_size, state_size, layers, scope,
+                  dropout_prob):
     embedding = tf.get_variable(
         name='input_embedding',
         shape=[input_num_tokens, encoder_input_size],
@@ -175,6 +180,15 @@ def build_encoder(input_ids, input_length, input_num_tokens, encoder_input_size,
     prepared_inputs = tf.nn.embedding_lookup(embedding, input_ids)
     encoder_fw_internal_cells = [tf.nn.rnn_cell.GRUCell(state_size) for _ in range(layers)]
     encoder_bw_internal_cells = [tf.nn.rnn_cell.GRUCell(state_size) for _ in range(layers)]
+
+    encoder_fw_internal_cells = [
+        tf.nn.rnn_cell.DropoutWrapper(cell, output_keep_prob=dropout_prob, state_keep_prob=dropout_prob)
+        for cell in encoder_fw_internal_cells
+    ]
+    encoder_bw_internal_cells = [
+        tf.nn.rnn_cell.DropoutWrapper(cell, output_keep_prob=dropout_prob, state_keep_prob=dropout_prob)
+        for cell in encoder_bw_internal_cells
+    ]
 
     from tensorflow.contrib.rnn import stack_bidirectional_dynamic_rnn
     return stack_bidirectional_dynamic_rnn(
@@ -189,8 +203,8 @@ def build_encoder(input_ids, input_length, input_num_tokens, encoder_input_size,
 
 
 def build_model(
-    batch_size, input_num_tokens, code_output_num_tokens, word_output_num_tokens,
-    word_output_num_generated_tokens
+        batch_size, input_num_tokens, code_output_num_tokens, word_output_num_tokens,
+        word_output_num_generated_tokens
 ):
     with vs("inputs"):
         input_ids = tf.placeholder(tf.int32, [None, batch_size], 'input_ids')
@@ -203,10 +217,13 @@ def build_model(
 
         copyable_input_ids = tf.placeholder(tf.int32, [None, batch_size], 'copyable_input_ids')
 
+        use_dropout = tf.placeholder(tf.bool, [], 'use_dropout')
+        dropout_prob = tf.cond(use_dropout, lambda: DROPOUT_PROB, lambda: 1.0)
+
     with vs("encoder") as encoder_scope:
         encoder_output, encoder_state_fw, encoder_state_bw = build_encoder(
             input_ids, input_length, input_num_tokens, ENCODER_INPUT_SIZE, ENCODER_STATE_SIZE,
-            ENCODER_LAYERS, encoder_scope
+            ENCODER_LAYERS, encoder_scope, dropout_prob
         )
 
         final_encoder_state_fw = encoder_state_fw[-1]
@@ -237,9 +254,10 @@ def build_model(
         decoder_cell = get_rnn_cell(
             num_layers=CODE_DECODER_LAYERS,
             state_size=decoder_state_size,
+            dropout_prob=dropout_prob,
             output_projection=True,
             projection_size=code_output_num_tokens,
-            attention=False,
+            attention=CODE_DECODER_ATTENTION,
             attention_source=attention_source_states,
             attention_vec_size=decoder_state_size,
         )
@@ -257,6 +275,8 @@ def build_model(
         if WORD_COPY_NET:
             internal_cells = [tf.nn.rnn_cell.GRUCell(decoder_state_size) for _ in range(WORD_DECODER_LAYERS)]
             basic_cell = tf.nn.rnn_cell.MultiRNNCell(internal_cells)
+            basic_cell = tf.nn.rnn_cell.DropoutWrapper(basic_cell, output_keep_prob=dropout_prob,
+                                                       state_keep_prob=dropout_prob)
             initial_state = basic_cell.zero_state(batch_size, tf.float32)
             initial_state = list(initial_state)
             initial_state[0] = encoder_result
@@ -274,6 +294,7 @@ def build_model(
             decoder_cell = get_rnn_cell(
                 num_layers=WORD_DECODER_LAYERS,
                 state_size=decoder_state_size,
+                dropout_prob=dropout_prob,
                 output_projection=True,
                 projection_size=word_output_num_tokens,
                 attention=WORD_DECODER_ATTENTION,
@@ -333,4 +354,5 @@ def build_model(
         'word_outputs': word_outputs,
         'loss': loss,
         'loss_with_l2': loss_with_l2,
+        'enable_dropout': use_dropout,
     })

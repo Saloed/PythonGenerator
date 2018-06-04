@@ -1,9 +1,12 @@
 import json
+import random
 import re
 
 import pandas as pd
 
 from collections import defaultdict
+
+from utilss import sequence_to_tree
 
 COMMON_WORD_COUNT_THRESHOLD = 0
 
@@ -176,57 +179,86 @@ def get_indexed_words(data_set_words, index):
     ]
 
 
-class Node:
-
-    def __init__(self, parent, token):
-        self.parent = parent
-        self.token = token
-        self.children = []
-
-
-def sequence_to_tree(sample, seq_end, subtree_start, subtree_end):
-    depth = -1
-    nodes = []
-    for token in sample:
-        if token == seq_end:
-            continue
-        if token == subtree_start:
-            depth += 1
-        elif token == subtree_end:
-            depth -= 1
-        else:
-            nodes.append((depth, token))
-
-    result = []
-
-    def get_node_on_depth(d):
-        i = d
-        res = result
-        while i > 0:
-            res = res[-1][1]
-            i -= 1
-        return res
-
-    for depth, node in nodes:
-        tree = get_node_on_depth(depth)
-        tree.append((node, []))
-
-    return result
-
-
 def convert_ast_to_tree(data_set, index):
     seq_end = index[SEQUENCE_END_TOKEN]
     subtree_start, subtree_end = index[SUBTREE_START_TOKEN], index[SUBTREE_END_TOKEN]
-    return [sequence_to_tree(s, seq_end, subtree_start, subtree_end) for s in data_set]
+    word_pc = index[WORD_PLACEHOLDER_TOKEN]
+    return [sequence_to_tree(s, seq_end, subtree_start, subtree_end, word_pc) for s in data_set]
+
+
+def construct_data_set(description, desc_weights, ast, words, trees):
+    return list(zip(description, desc_weights, ast, words, trees))
+
+
+def shuffle_and_split_data_set(data_set, valid_split, test_split):
+    test_split_size = len(data_set) // test_split
+    valid_split_size = len(data_set) // valid_split
+    random.shuffle(data_set)
+    return {
+        'test': data_set[:test_split_size],
+        'valid': data_set[test_split_size:test_split_size + valid_split_size],
+        'train': data_set[test_split_size + valid_split_size:]
+    }
+
+
+def deconstruct_data_set(data_set, split_name):
+    return {
+        'indexed_description': [desc for desc, *_ in data_set[split_name]],
+        'description_weights': [desc_weight for _, desc_weight, *_ in data_set[split_name]],
+        'indexed_ast': [ast for _, _, ast, *_ in data_set[split_name]],
+        'indexed_words': [words for *_, words, _ in data_set[split_name]],
+        'ast_tree': [ast for *_, ast in data_set[split_name]],
+    }
+
+
+def get_copy_words(description_idx, words_idx, word_tar):
+    train_word_ids = {word_id for sample in word_tar for word_id in sample}
+    train_words_idx = {key: value for key, value in words_idx.items() if value in train_word_ids}
+    similar_words = (description_idx.keys() & train_words_idx.keys()) - {SEQUENCE_END_TOKEN}
+    mapping = {description_idx[key]: words_idx[key] for key in similar_words}
+    return mapping
+
+
+def filter_big_sequences(data_set):
+    return [d for d in data_set if len(d[0]) < 200]
+
+
+def pc_is_ok(pc):
+    return not (pc[0] == '-' and pc[-1] == '-')
+
+
+def remove_unused_word_pc(code, words):
+    word_iter = iter(words)
+
+    def check_next_pc():
+        next_pc = next(word_iter)
+        return pc_is_ok(next_pc)
+
+    result = [
+        c
+        for c in code
+        if c != WORD_PLACEHOLDER_TOKEN or check_next_pc()
+    ]
+    return result
+
+
+def remove_unused_words(words):
+    return [word for word in words if pc_is_ok(word)]
 
 
 def convert_json_content():
     data_set = pd.read_json('django_data_set_str.json')
+    asts = convert_ast(data_set['ast'])
+    words = convert_words(data_set['words'])
+
+    asts = [remove_unused_word_pc(code, word) for code, word in zip(asts, words)]
+    words = [remove_unused_words(word) for word in words]
+
     converted_data_set = {
         'src': list(data_set['src']),
         'description': convert_description(data_set['description']),
-        'ast': convert_ast(data_set['ast']),
-        'words': convert_words(data_set['words'])
+        'ast': asts,
+        'words': words
     }
     ast_token_index, ast_token_r_index = get_ast_token_indexes(converted_data_set['ast'])
     indexed_ast = get_indexed_ast(converted_data_set['ast'], ast_token_index)
@@ -250,22 +282,29 @@ def convert_json_content():
 
     ast_tree = convert_ast_to_tree(indexed_ast, ast_token_index)
 
+    _data_set = construct_data_set(indexed_description, description_word_weights, indexed_ast, indexed_words, ast_tree)
+    _data_set = filter_big_sequences(_data_set)
+    splitted_data_set = shuffle_and_split_data_set(_data_set, 10, 10)
+
+    train_set = deconstruct_data_set(splitted_data_set, 'train')
+    copy_word_mapping = get_copy_words(description_word_index, words_index, train_set['indexed_words'])
+
+    converted_data_set['train'] = train_set
+    converted_data_set['valid'] = deconstruct_data_set(splitted_data_set, 'valid')
+    converted_data_set['test'] = deconstruct_data_set(splitted_data_set, 'test')
+
     converted_data_set['ast_token_index'] = ast_token_index
     converted_data_set['ast_token_r_index'] = ast_token_r_index
-    converted_data_set['indexed_ast'] = indexed_ast
 
     converted_data_set['desc_word_index'] = description_word_index
     converted_data_set['desc_word_r_index'] = description_word_r_index
-    converted_data_set['indexed_description'] = indexed_description
-    converted_data_set['description_weights'] = description_word_weights
 
     converted_data_set['words_index'] = words_index
     converted_data_set['words_r_index'] = words_r_index
-    converted_data_set['indexed_words'] = indexed_words
 
-    converted_data_set['ast_tree'] = ast_tree
+    converted_data_set['copy_word_mapping'] = copy_word_mapping
 
-    with open('django_data_set_3.json', 'w') as f:
+    with open('django_data_set_4.json', 'w') as f:
         json.dump(converted_data_set, f, indent=4)
 
 

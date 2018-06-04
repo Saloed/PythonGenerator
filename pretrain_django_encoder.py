@@ -80,7 +80,7 @@ def train(data_set, description_num_tokens, code_num_tokens, input_end_marker):
         input_length = tf.placeholder(tf.int32, [BATCH_SIZE], 'input_len')
 
         encoder_output, encoder_state_fw, encoder_state_bw = build_encoder(
-            input_ids, input_length, description_num_tokens, 128, 64, 1, e_scope
+            input_ids, input_length, description_num_tokens, 128, 64, 1, e_scope, 0.8
         )
         final_encoder_state_fw = encoder_state_fw[-1]
         final_encoder_state_bw = encoder_state_bw[-1]
@@ -128,13 +128,10 @@ def train(data_set, description_num_tokens, code_num_tokens, input_end_marker):
 
 
 def main():
-    with open('django_data_set_3.json') as f:
+    with open('django_data_set_4.json') as f:
         data_set = json.load(f)
-    descriptions = data_set['indexed_description']
-    trees = data_set['ast_tree']
-    split_position = len(descriptions) // 10
-    descriptions = descriptions[split_position:]
-    trees = trees[split_position:]
+    descriptions = data_set['train']['indexed_description']
+    trees = data_set['train']['ast_tree']
     nodes = convert_trees_to_node(trees, data_set['ast_token_index'][SUBTREE_START_TOKEN])
     zero_index = data_set['ast_token_index'][SEQUENCE_END_TOKEN]
     input_end_marker = data_set['desc_word_index'][SEQUENCE_END_TOKEN]

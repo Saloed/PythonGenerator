@@ -9,11 +9,14 @@ import DummySeq2Seq
 
 from traceback import print_tb
 
-from nltk.translate.bleu_score import sentence_bleu
+from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 
 from analyze_django_prepare import SEQUENCE_END_TOKEN, WORD_PLACEHOLDER_TOKEN
-from utilss import dump_object, load_object
+from code_from_ast import generate_source
+from utilss import dump_object, load_object, fix_r_index_keys, insert_words_into_placeholders
 from net_conf import *
+
+# from results.model_9_net_conf import *
 
 DATA_SET_FIELDS = [
     'input',
@@ -23,11 +26,6 @@ DATA_SET_FIELDS = [
 ]
 
 BATCH_SIZE = 6
-
-
-def split_data_set(split_size, data_set):
-    split_position = len(data_set) // split_size
-    return data_set[:split_position], data_set[split_position:]
 
 
 def align_batch(batch, seq_end_marker, time_major=True):
@@ -119,6 +117,7 @@ def run_seq2seq_model(
     result_outputs = []
     batch_count = len(data_set)
     for j, feed in enumerate(make_feed_from_data_set(data_set, model)):
+        feed[model.enable_dropout] = is_train
         results = session.run(fetches=fetches, feed_dict=feed)
         if is_train:
             err, summary, *_ = results
@@ -206,6 +205,7 @@ def eval_model(
     with tf.Session(config=config) as sess, tf.device('/cpu:0'):
         sess.run(initializer)
         saver.restore(sess, 'models/model-8')
+        # saver.restore(sess, 'results/model_9_bleu_73')
         loss, outputs = run_seq2seq_model(
             data_set=batches,
             model=model,
@@ -219,13 +219,16 @@ def eval_model(
     dump_object(result, 'model_new_res')
 
 
-def insert_words_into_placeholders(code, words):
-    word_iter = iter(words)
-    result = [
-        c if c != WORD_PLACEHOLDER_TOKEN else next(word_iter, '__NO_WORD__')
-        for c in code
-    ]
-    return result
+def get_sequence_up_to_end(sequence, with_end=True):
+    return list(itertools.takewhile(lambda x: x != SEQUENCE_END_TOKEN, sequence)) + (
+        [SEQUENCE_END_TOKEN] if with_end else [])
+
+
+def get_sources(code, words):
+    code = get_sequence_up_to_end(code)
+    words = get_sequence_up_to_end(words, with_end=False)
+    sources = generate_source([code], [words])
+    return sources[0]
 
 
 def compare_outputs_and_targets(outputs, target, target_len):
@@ -234,13 +237,24 @@ def compare_outputs_and_targets(outputs, target, target_len):
     code_targets, word_targets = target
     real_code_outputs, real_code_targets = code_outputs[:code_len], code_targets[:code_len]
     real_word_outputs, real_word_targets = word_outputs[:words_len], word_targets[:words_len]
-    combined = insert_words_into_placeholders(code_outputs, word_outputs)
-    combined_targets = insert_words_into_placeholders(code_targets, word_targets)
-    real_combined = insert_words_into_placeholders(real_code_outputs, real_word_outputs)
-    real_combined_targets = insert_words_into_placeholders(real_code_targets, real_word_targets)
-    code_bleu = sentence_bleu([combined_targets], combined)
-    _real_combined = list(itertools.takewhile(lambda x: x != SEQUENCE_END_TOKEN, combined)) + [SEQUENCE_END_TOKEN]
-    real_code_bleu = sentence_bleu([real_combined_targets], _real_combined)
+    combined = insert_words_into_placeholders(code_outputs, word_outputs, WORD_PLACEHOLDER_TOKEN)
+    combined_targets = insert_words_into_placeholders(code_targets, word_targets, WORD_PLACEHOLDER_TOKEN)
+    real_combined = insert_words_into_placeholders(real_code_outputs, real_word_outputs, WORD_PLACEHOLDER_TOKEN)
+    real_combined_targets = insert_words_into_placeholders(real_code_targets, real_word_targets, WORD_PLACEHOLDER_TOKEN)
+
+    # target_sources = get_sources(code_targets, word_targets)
+    # generated_sources = get_sources(code_outputs, word_outputs)
+
+    #
+    # sm = SmoothingFunction()
+    #
+    # ngram_weights = [0.25] * min(4, len(combined_targets))
+    # code_bleu = sentence_bleu([combined_targets], combined, weights=ngram_weights,
+    #                           smoothing_function=sm.method3)
+    #
+    # ngram_weights = [0.25] * min(4, len(real_combined_targets))
+    # real_code_bleu = sentence_bleu([real_combined_targets], _real_combined, weights=ngram_weights,
+    #                                smoothing_function=sm.method3)
     return {
         'all_code_seq': sum(o == t for o, t in zip(code_outputs, code_targets)),
         'code_seq_len': len(code_targets),
@@ -254,8 +268,8 @@ def compare_outputs_and_targets(outputs, target, target_len):
         'code_len': len(combined_targets),
         'real_code': sum(o == t for o, t in zip(real_combined, real_combined_targets)),
         'read_code_len': code_len,
-        'code_bleu': code_bleu,
-        'real_code_bleu': real_code_bleu,
+        'code_bleu': 0,
+        'real_code_bleu': 0,
     }
 
 
@@ -368,46 +382,38 @@ def train_model(
             print_tb(ex.__traceback__)
 
 
-def filter_big_sequences(data_set):
-    return [d for d in data_set if len(d[0]) < 200]
-
-
-def fix_r_index_keys(r_index):
-    return {int(key): value for key, value in r_index.items()}
-
-
-def get_copy_words(description_idx, words_idx, train_set):
-    *_, word_tar = destruct_data_set(train_set)
-    train_word_ids = {word_id for sample in word_tar for word_id in sample}
-    train_words_idx = {key: value for key, value in words_idx.items() if value in train_word_ids}
-    similar_words = (description_idx.keys() & train_words_idx.keys()) - {SEQUENCE_END_TOKEN}
-    mapping = {description_idx[key]: words_idx[key] for key in similar_words}
-    return mapping
+def construct_data_sets(data_set):
+    return {
+        set_name: construct_data_set(
+            input=data_set[set_name]['indexed_description'],
+            input_weight=data_set[set_name]['description_weights'],
+            code_target=data_set[set_name]['indexed_ast'],
+            word_target=data_set[set_name]['indexed_words'],
+        )
+        for set_name in ('test', 'valid', 'train')
+    }
 
 
 def analyze(train):
-    with open('django_data_set_3.json') as f:
+    with open('django_data_set_4.json') as f:
         data_set = json.load(f)
 
-    constructed_data_set = construct_data_set(
-        input=data_set['indexed_description'],
-        input_weight=data_set['description_weights'],
-        code_target=data_set['indexed_ast'],
-        word_target=data_set['indexed_words'],
-    )
+    constructed_data_set = construct_data_sets(data_set)
+    train_set = constructed_data_set['train']
+    valid_set = constructed_data_set['valid']
+    test_set = constructed_data_set['test']
 
-    constructed_data_set = filter_big_sequences(constructed_data_set)
-
-    valid_set, train_set = split_data_set(10, constructed_data_set)
-
-    copy_word_mapping = get_copy_words(data_set['desc_word_index'], data_set['words_index'], train_set)
+    copy_word_mapping = data_set['copy_word_mapping']
 
     num_ast_tokens = len(data_set['ast_token_index'])
     num_description_tokens = len(data_set['desc_word_index'])
     num_word_tokens = len(data_set['words_index'])
     num_generated_words = num_word_tokens - len(copy_word_mapping)
 
-    print(len(train_set), len(valid_set), num_ast_tokens, num_description_tokens, num_word_tokens, num_generated_words)
+    print(
+        len(train_set), len(valid_set), len(test_set),
+        num_ast_tokens, num_description_tokens, num_word_tokens, num_generated_words
+    )
 
     if train:
         train_model(
@@ -424,7 +430,7 @@ def analyze(train):
         )
     else:
         eval_model(
-            data_set=valid_set,
+            data_set=test_set,
             num_input_tokens=num_description_tokens,
             input_end_marker=data_set['desc_word_index'][SEQUENCE_END_TOKEN],
             num_code_output_tokens=num_ast_tokens,
@@ -439,6 +445,6 @@ def analyze(train):
 
 
 if __name__ == '__main__':
-    analyze(True)
-    # analyze(False)
-    # lookup_eval_result()
+    # analyze(True)
+    analyze(False)
+    lookup_eval_result()
