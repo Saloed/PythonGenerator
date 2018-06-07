@@ -1,6 +1,7 @@
 import itertools
 import json
 import random
+import re
 
 import numpy as np
 import tensorflow as tf
@@ -146,8 +147,10 @@ def replace_indexes_by_tokens(data, r_index):
     return [r_index[d] for d in data]
 
 
-def ungroup_outputs(outputs, code_r_index, word_r_index, targets=None, targets_is_data_set=True, time_major=True):
-    def ungroup(smth):
+def ungroup_outputs(outputs, code_r_index, word_r_index, desc_r_index,
+                    targets=None, inputs=None, inputs_is_data_set=True,
+                    targets_is_data_set=True, time_major=True):
+    def ungroup_code_and_words(smth):
         if time_major:
             smth = ((replace_time_major(code), replace_time_major(words)) for code, words in smth)
         samples = (sample for batch in smth for sample in zip(*batch))
@@ -157,7 +160,17 @@ def ungroup_outputs(outputs, code_r_index, word_r_index, targets=None, targets_i
         ]
         return samples
 
-    result = ungroup(outputs)
+    def ungroup_inputs(smth):
+        if time_major:
+            smth = (replace_time_major(inp) for inp in smth)
+        samples = (sample for batch in smth for sample in batch)
+        samples = [
+            replace_indexes_by_tokens(desc, desc_r_index)
+            for desc in samples
+        ]
+        return samples
+
+    result = ungroup_code_and_words(outputs)
     if targets is not None:
         if targets_is_data_set:
             target_lens = [
@@ -168,7 +181,21 @@ def ungroup_outputs(outputs, code_r_index, word_r_index, targets=None, targets_i
             targets = [(code_tar, word_tar) for *_, (code_tar, _), (word_tar, _) in targets]
         else:
             target_lens = None
-        result = result, ungroup(targets), target_lens
+        result = result, ungroup_code_and_words(targets), target_lens
+    if inputs is not None:
+        if inputs_is_data_set:
+            inputs_len = [
+                input_length
+                for (inputs, inputs_length), *_ in inputs
+                for input_length in inputs_length
+            ]
+            inputs = [inp for (inp, inputs_length), *_ in inputs]
+        else:
+            inputs_len = None
+        if isinstance(result, tuple):
+            result = result + (ungroup_inputs(inputs), inputs_len)
+        else:
+            result = result, ungroup_inputs(inputs), inputs_len
     return result
 
 
@@ -184,6 +211,7 @@ def eval_model(
         word_output_end_marker,
         code_r_index,
         word_r_index,
+        desc_r_index,
 ):
     batch_preprocess_fn = preprocess_batch_fn_builder(
         input_end_marker, 1.0, code_output_end_marker, word_output_end_marker, copy_word_mapping, time_major=True
@@ -204,7 +232,7 @@ def eval_model(
     saver = tf.train.Saver(max_to_keep=100)
     with tf.Session(config=config) as sess, tf.device('/cpu:0'):
         sess.run(initializer)
-        saver.restore(sess, 'models/model-8')
+        saver.restore(sess, 'models/model-6')
         # saver.restore(sess, 'results/model_9_bleu_73')
         loss, outputs = run_seq2seq_model(
             data_set=batches,
@@ -214,7 +242,7 @@ def eval_model(
             need_outputs=True,
         )
     print(f'loss {loss}')
-    result = ungroup_outputs(outputs, code_r_index, word_r_index, targets=batches)
+    result = ungroup_outputs(outputs, code_r_index, word_r_index, desc_r_index, targets=batches, inputs=batches)
 
     dump_object(result, 'model_new_res')
 
@@ -224,11 +252,21 @@ def get_sequence_up_to_end(sequence, with_end=True):
         [SEQUENCE_END_TOKEN] if with_end else [])
 
 
-def get_sources(code, words):
+def get_sources(code, words, is_generated):
     code = get_sequence_up_to_end(code)
     words = get_sequence_up_to_end(words, with_end=False)
-    sources = generate_source([code], [words])
+    sources = generate_source([code], [words], is_generated)
     return sources[0]
+
+
+def tokenize_for_bleu_eval(code):
+    code = re.sub(r'([^A-Za-z0-9_])', r' \1 ', code)
+    code = re.sub(r'([a-z])([A-Z])', r'\1 \2', code)
+    code = re.sub(r'\s+', ' ', code)
+    code = code.replace('"', '`')
+    code = code.replace('\'', '`')
+    tokens = [t for t in code.split(' ') if t]
+    return tokens
 
 
 def compare_outputs_and_targets(outputs, target, target_len):
@@ -242,19 +280,23 @@ def compare_outputs_and_targets(outputs, target, target_len):
     real_combined = insert_words_into_placeholders(real_code_outputs, real_word_outputs, WORD_PLACEHOLDER_TOKEN)
     real_combined_targets = insert_words_into_placeholders(real_code_targets, real_word_targets, WORD_PLACEHOLDER_TOKEN)
 
-    # target_sources = get_sources(code_targets, word_targets)
-    # generated_sources = get_sources(code_outputs, word_outputs)
+    target_sources = get_sources(code_targets, word_targets, False)
+    generated_sources = get_sources(code_outputs, word_outputs, True)
 
-    #
-    # sm = SmoothingFunction()
-    #
-    # ngram_weights = [0.25] * min(4, len(combined_targets))
-    # code_bleu = sentence_bleu([combined_targets], combined, weights=ngram_weights,
-    #                           smoothing_function=sm.method3)
-    #
-    # ngram_weights = [0.25] * min(4, len(real_combined_targets))
-    # real_code_bleu = sentence_bleu([real_combined_targets], _real_combined, weights=ngram_weights,
-    #                                smoothing_function=sm.method3)
+    target_tokens = [tk for tk in target_sources.split()]
+    generated_tokens = [tk for tk in generated_sources.split()]
+    print('------------')
+    print(target_tokens)
+    print(generated_tokens)
+    target_tokens_bleu = tokenize_for_bleu_eval(target_sources)
+    generated_tokens_bleu = tokenize_for_bleu_eval(generated_sources)
+
+    sm = SmoothingFunction()
+
+    ngram_weights = [0.25] * min(4, len(target_tokens_bleu))
+    code_bleu = sentence_bleu([target_tokens_bleu], generated_tokens_bleu, weights=ngram_weights,
+                              smoothing_function=sm.method3)
+
     return {
         'all_code_seq': sum(o == t for o, t in zip(code_outputs, code_targets)),
         'code_seq_len': len(code_targets),
@@ -268,14 +310,15 @@ def compare_outputs_and_targets(outputs, target, target_len):
         'code_len': len(combined_targets),
         'real_code': sum(o == t for o, t in zip(real_combined, real_combined_targets)),
         'read_code_len': code_len,
-        'code_bleu': 0,
-        'real_code_bleu': 0,
+        'code_accuracy': sum(o == t for o, t in itertools.zip_longest(target_tokens, generated_tokens)),
+        'code_accuracy_len': max(len(target_tokens), len(generated_tokens)),
+        'code_bleu': code_bleu,
     }
 
 
 def lookup_eval_result():
     result = load_object('model_new_res')
-    outputs, targets, target_length = result
+    outputs, targets, target_length, inputs, input_length = result
     stats = [
         compare_outputs_and_targets(out, tar, tar_len)
         for out, tar, tar_len in zip(outputs, targets, target_length)
@@ -290,13 +333,15 @@ def lookup_eval_result():
     code_percents = [st['code'] / st['code_len'] for st in stats]
     real_code_percents = [st['real_code'] / st['read_code_len'] for st in stats]
 
+    code_acc = [st['code_accuracy'] / st['code_accuracy_len'] for st in stats]
     code_bleu = [st['code_bleu'] for st in stats]
-    real_code_bleu = [st['real_code_bleu'] for st in stats]
+    # real_code_bleu = [st['real_code_bleu'] for st in stats]
 
     print(f'code: all {np.mean(all_code_seq_percents)} real {np.mean(real_code_seq_percents)}')
     print(f'words: all {np.mean(all_word_seq_percents)} real {np.mean(real_word_seq_percents)}')
     print(f'combined: all {np.mean(code_percents)} real {np.mean(real_code_percents)}')
-    print(f'bleu: all {np.mean(code_bleu)} real {np.mean(real_code_bleu)}')
+    print(f'bleu: all {np.mean(code_bleu)}')
+    print(f'accuracy: all {np.mean(code_acc)}')
 
 
 def build_loss_summary(model):
@@ -441,10 +486,11 @@ def analyze(train):
             word_output_end_marker=data_set['words_index'][SEQUENCE_END_TOKEN],
             code_r_index=fix_r_index_keys(data_set['ast_token_r_index']),
             word_r_index=fix_r_index_keys(data_set['words_r_index']),
+            desc_r_index=fix_r_index_keys(data_set['desc_word_r_index']),
         )
 
 
 if __name__ == '__main__':
     # analyze(True)
-    analyze(False)
+    # analyze(False)
     lookup_eval_result()

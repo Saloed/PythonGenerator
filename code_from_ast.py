@@ -1,3 +1,4 @@
+import re
 import ast
 import astor
 import json
@@ -6,24 +7,54 @@ import builtins
 from utilss import fix_r_index_keys, sequence_to_tree
 from analyze_django_prepare import SEQUENCE_END_TOKEN, WORD_PLACEHOLDER_TOKEN, SUBTREE_START_TOKEN, SUBTREE_END_TOKEN
 
+import code_generator
+
 BOOL_TYPES = {'bool'}
 NUMERIC_TYPES = {'int', 'float', 'complex'}
 STR_TYPES = {'str'}
 BINARY_TYPES = {'bytes', 'bytearray', 'memoryview'}
 BUILT_IN_TYPES = BOOL_TYPES | NUMERIC_TYPES | STR_TYPES | BINARY_TYPES
 
+constructor_exception_re = 'constructor takes either (\w+) or (\w+)'
 
-def get_ast_node(node_type, *args, **kwargs):
+
+def get_ast_node(node_type, default_empty, *args, **kwargs):
     ast_node_type = getattr(ast, node_type)
-    ast_node = ast_node_type(*args, **kwargs)
+    _args = []
+    args_iter = iter(args)
+
+    def get_default():
+        return [] if not default_empty else code_generator.EmptyNode()
+
+    for field_name in ast_node_type._fields:
+        if field_name in kwargs:
+            _args.append(kwargs[field_name])
+        else:
+            elem = next(args_iter, get_default())
+            _args.append(elem)
+    # try:
+    ast_node = ast_node_type(*_args)
+    # except Exception as ex:
+    #     groups = re.search(constructor_exception_re, str(ex))
+    #     min_args = int(groups.group(1))
+    #     max_args = int(groups.group(2))
+    #     current_len = len(args) + len(kwargs)
+    #     for i in range(max_args - current_len):
+    #         args = args + (code_generator.EmptyNode(),)
+    #     ast_node = ast_node_type(*args, **kwargs)
+
     for field_name in ast_node._fields:
-        if not hasattr(ast_node, field_name):
-            default_value = []
+        attr = getattr(ast_node, field_name)
+        if isinstance(attr, code_generator.EmptyNode):
+            if field_name == 'ctx':
+                default_value = ast.Load()
+            else:
+                continue
             setattr(ast_node, field_name, default_value)
     return ast_node
 
 
-def convert_to_ast(code, words):
+def convert_to_ast(code, words, default_empty):
     word_iter = iter(words)
 
     def walk_and_insert_word_pc(node):
@@ -40,7 +71,7 @@ def convert_to_ast(code, words):
         ) and node_type != 'slice':
             kwargs = {child[0]: child[1] for child in children if isinstance(child, tuple)}
             args = [child for child in children if not isinstance(child, tuple)]
-            ast_node = get_ast_node(node_type, *args, **kwargs)
+            ast_node = get_ast_node(node_type, default_empty, *args, **kwargs)
             return ast_node
         if not children:
             return '__EMPTY__CHILDREN__'
@@ -59,19 +90,18 @@ def convert_to_ast(code, words):
     return result
 
 
-def generate_source(asts, words):
+def generate_source(asts, words, ast_with_bugs=False):
     trees = [
         sequence_to_tree(sample, SEQUENCE_END_TOKEN, SUBTREE_START_TOKEN, SUBTREE_END_TOKEN, WORD_PLACEHOLDER_TOKEN)
         for sample in asts
     ]
 
     converted = [
-        convert_to_ast(code, word)
+        convert_to_ast(code, word, ast_with_bugs)
         for code, word in zip(trees, words)
     ]
     sources = [[astor.to_source(root) for root in tree] for tree in converted]
     sources = ['\n'.join(src_parts) for src_parts in sources]
-
     return sources
 
 

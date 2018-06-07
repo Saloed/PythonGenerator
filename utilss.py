@@ -1,4 +1,5 @@
 import _pickle as P
+
 import tensorflow as tf
 
 
@@ -57,7 +58,10 @@ def sequence_to_tree(sample, seq_end, subtree_start, subtree_end, word_pc):
         i = d
         res = result
         while i > 0:
-            res = res[-1][1]
+            if not res:
+                res.append(('__EMPTY_NODE__', []))
+            tmp = res[-1]
+            res = tmp[1]
             i -= 1
         return res
 
