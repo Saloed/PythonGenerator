@@ -18,15 +18,11 @@ def _tree_to_list(tree_root_token: Token) -> list:
     return _indexate(token_list)
 
 
-def convert_trees_to_node(trees, common_root):
-    return [_convert_to_node(it, common_root) for it in trees]
+def convert_trees_to_node(trees):
+    return [_convert_to_node(it) for it in trees]
 
 
-def _convert_to_node(tree, common_root):
-    if len(tree) > 1:
-        tree = [common_root, tree]
-    else:
-        tree = tree[0]
+def _convert_to_node(tree):
     root_token = _convert_to_token(tree)
     tree_as_list = _tree_to_list(root_token)
     non_leafs = [t for t in tree_as_list if not t.is_leaf]

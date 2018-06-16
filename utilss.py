@@ -5,7 +5,7 @@ import tensorflow as tf
 
 def dump_object(obj, name):
     with open(name, 'wb') as f:
-        P.dump(obj, f)
+        P.dump(obj, f, protocol=2)
 
 
 def load_object(name):

@@ -1,22 +1,16 @@
 import tensorflow as tf
 
-from .TFParameters import NUM_CONVOLUTION, BATCH_SIZE, L2_PARAM
+from .TFParameters import NUM_CONVOLUTION, BATCH_SIZE
 
 
 class Net:
     def __init__(self,
                  out,
-                 # loss, error, max_loss, result, target,
                  pc,
                  dropout):
         self.out = out
-        # self.loss = loss
-        # self.error = error
-        # self.max_loss = max_loss
         self.placeholders = pc
         self.dropout = dropout
-        # self.result = result
-        # self.target = target
 
 
 class Placeholders:
@@ -26,7 +20,6 @@ class Placeholders:
         self.node_emb = None
         self.node_left_c = None
         self.node_right_c = None
-        # self.target = None
 
     def assign(self, placeholders):
         pc = placeholders  # type: Placeholders
@@ -36,7 +29,6 @@ class Placeholders:
             self.node_children: pc.node_children,
             self.node_left_c: pc.node_left_c,
             self.node_right_c: pc.node_right_c,
-            # self.target: pc.target
         }
 
 
@@ -50,12 +42,6 @@ def create_convolution(params):
         pc.node_left_c = tf.placeholder(tf.float32, [None], 'left_c')
         pc.node_right_c = tf.placeholder(tf.float32, [None], 'right_c')
 
-    # def make_embedding(embedding):
-    #     return tf.nn.relu(embedding @ params.w['w_emb'] + params.b['b_emb'])
-
-    # with tf.name_scope('Target'):
-    #     pc.target = tf.placeholder(tf.int64, [1], 'target')
-
     def loop_cond(_, i):
         return tf.less(i, tf.squeeze(tf.shape(pc.root_nodes)))
 
@@ -65,9 +51,7 @@ def create_convolution(params):
         children_emb_i = tf.gather(pc.node_emb, root_ch_i)
         root = tf.gather(embeddings, root_emb)
         root = tf.expand_dims(root, 0)
-        # root = make_embedding(root)
         children_emb = tf.gather(embeddings, children_emb_i)
-        # children_emb = make_embedding(children_emb)
         children_l_c = tf.gather(pc.node_left_c, root_ch_i)
         children_r_c = tf.gather(pc.node_right_c, root_ch_i)
         children_l_c = tf.expand_dims(children_l_c, 1)
@@ -106,39 +90,18 @@ def create_convolution(params):
 def create(params):
     placeholders = []
     convolutions = []
-    # targets = []
     with tf.name_scope('Convolution'):
         for _ in range(BATCH_SIZE):
             conv, pc = create_convolution(params)
             convolutions.append(conv)
             placeholders.append(pc)
-            # targets.append(pc.target)
         convolution = tf.concat(convolutions, axis=0, name='convolution')
-    # target = tf.concat(targets, axis=0, name='target')
     with tf.name_scope('Hidden'):
         dropout_prob = tf.placeholder(tf.float32)
         hid_layer = tf.nn.tanh(convolution @ params.w['w_hid'] + params.b['b_hid'])
-    #     hid_layer = tf.nn.dropout(hid_layer, dropout_prob)
         return Net(hid_layer, placeholders, dropout_prob)
-    # with tf.name_scope('Out'):
-    #     logits = tf.matmul(hid_layer, params.w['w_out'] + params.b['b_out'])
-    #     out = tf.nn.softmax(logits)
-    #     result = tf.argmax(out, 1)
-    # with tf.name_scope('Error'):
-    #     loss = tf.nn.sparse_softmax_cross_entropy_with_logits(logits=logits, labels=target)
-    #     error = tf.cast(tf.not_equal(result, target), tf.float32)
-    #     loss = tf.reduce_mean(loss)
-    #     error = tf.reduce_mean(error)
-    #     max_loss = tf.reduce_max(loss)
-    # return Net(out, loss, error, max_loss, result, target, placeholders, dropout_prob)
 
 
 def build_net(params):
     net = create(params)
-    # with tf.name_scope('L2_Loss'):
-    #     reg_weights = [tf.nn.l2_loss(p) for p in params.w.values()]
-    #     l2 = L2_PARAM * tf.reduce_sum(reg_weights)
-    # cost = net.loss + l2
-    # updates = tf.train.AdamOptimizer().minimize(cost)
-    # summaries = tf.summary.merge_all()
     return net  # updates, summaries

@@ -4,8 +4,9 @@ from tensorflow import variable_scope as vs
 
 import copy_net
 from utilss import dict_to_object
-from net_conf import *
 
+from net_conf import *
+# from new_res.model_1_conf import *
 
 # from results.model_9_net_conf import *
 
@@ -203,12 +204,10 @@ def build_encoder(input_ids, input_length, input_num_tokens, encoder_input_size,
 
 
 def build_model(
-        batch_size, input_num_tokens, code_output_num_tokens, word_output_num_tokens,
-        word_output_num_generated_tokens
+    batch_size, input_num_tokens, code_output_num_tokens, word_output_num_tokens
 ):
     with vs("inputs"):
         input_ids = tf.placeholder(tf.int32, [None, batch_size], 'input_ids')
-        input_weights = tf.placeholder(tf.float32, [None, batch_size], 'input_weight')
         input_length = tf.placeholder(tf.int32, [batch_size], 'input_length')
         code_target_labels = tf.placeholder(tf.int32, [None, batch_size], 'code_outputs')
         code_target_length = tf.placeholder(tf.int32, [batch_size], 'output_length')
@@ -286,7 +285,6 @@ def build_model(
                 encoder_states=encoder_output,
                 encoder_input_ids=copyable_input_ids,
                 vocab_size=word_output_num_tokens,
-                gen_vocab_size=word_output_num_generated_tokens,
                 initial_cell_state=initial_state
             )
             decoder_initial_state = None
@@ -335,15 +333,14 @@ def build_model(
         loss_with_l2 = loss + l2_loss
 
     with vs("output"):
-        code_outputs = tf.nn.softmax(code_decoder_output)
-        code_outputs = tf.argmax(code_outputs, axis=-1)
+        code_outputs_prob = tf.nn.softmax(code_decoder_output)
+        code_outputs = tf.argmax(code_outputs_prob, axis=-1)
 
-        word_outputs = tf.nn.softmax(word_decoder_output)
-        word_outputs = tf.argmax(word_outputs, axis=-1)
+        word_outputs_prob = tf.nn.softmax(word_decoder_output)
+        word_outputs = tf.argmax(word_outputs_prob, axis=-1)
 
     return dict_to_object({
         'inputs': input_ids,
-        'input_weight': input_weights,
         'input_len': input_length,
         'copyable_input_ids': copyable_input_ids,
         'code_target': code_target_labels,
@@ -352,6 +349,8 @@ def build_model(
         'word_target_len': word_target_length,
         'code_outputs': code_outputs,
         'word_outputs': word_outputs,
+        'code_outputs_prob': code_outputs_prob,
+        'word_outputs_prob': word_outputs_prob,
         'loss': loss,
         'loss_with_l2': loss_with_l2,
         'enable_dropout': use_dropout,
