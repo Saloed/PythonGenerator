@@ -27,6 +27,7 @@ DATA_SET_FIELDS = [
     'copy_words',
     'code_target',
     'word_target',
+    'copy_target',
 ]
 
 BATCH_SIZE = 6
@@ -59,21 +60,17 @@ def construct_data_set(**kwargs):
     return data_set
 
 
-def make_copy_words(input, copy_word_mapping):
-    input, _ = input
-    return np.asarray([[copy_word_mapping.get(word, -1) for word in smt] for smt in input])
-
-
 def preprocess_batch_fn_builder(
         input_end_marker, code_tar_end_marker, word_tar_end_marker, time_major=True
 ):
     def preprocess_batch(batch):
-        _id, input, copy_words, code_tar, word_tar = destruct_data_set(batch)
+        _id, input, copy_words, code_tar, word_tar, copy_tar = destruct_data_set(batch)
         input = align_batch(input, input_end_marker, time_major)
         code_tar = align_batch(code_tar, code_tar_end_marker, time_major)
         word_tar = align_batch(word_tar, word_tar_end_marker, time_major)
         copy_words = align_batch(copy_words, -1, time_major)
-        return _id, input, copy_words, code_tar, word_tar
+        copy_tar = align_batch(copy_tar, -1, time_major)
+        return _id, input, copy_words, code_tar, word_tar, copy_tar
 
     return preprocess_batch
 
@@ -93,7 +90,7 @@ def group_by_batches(data_set, batch_size, batch_preprocess_fn, shuffle=True):
 
 
 def make_feed_from_data_set(data_set, model):
-    for _id, (inputs, inputs_length), (copy_words, _), (code_tar, code_tar_len), (word_tar, word_tar_len) in data_set:
+    for _id, (inputs, inputs_length), (copy_words, _), (code_tar, code_tar_len), (word_tar, word_tar_len), (copy_tar, _) in data_set:
         yield _id, {
             model.inputs: inputs,
             model.input_len: inputs_length,
@@ -102,6 +99,8 @@ def make_feed_from_data_set(data_set, model):
             model.word_target: word_tar,
             model.word_target_len: word_tar_len,
             model.copyable_input_ids: copy_words,
+            model.copy_target: copy_tar,
+            model.unknown_word: 1,
         }
 
 
@@ -114,7 +113,13 @@ def run_seq2seq_model(
     if is_train:
         fetches += [summaries, updates]
     if need_outputs:
-        fetches += [model.code_outputs, model.word_outputs, model.code_outputs_prob, model.word_outputs_prob]
+        fetches += [
+            model.code_outputs,
+            model.word_outputs,
+            model.copy_outputs,
+            model.code_outputs_prob,
+            model.word_outputs_prob
+        ]
     result_loss = []
     result_outputs = []
     batch_count = len(data_set)
@@ -128,8 +133,8 @@ def run_seq2seq_model(
             err = results[0]
 
         if need_outputs:
-            code_output, word_output, code_outputs_prob, word_outputs_prob = results[-4:]
-            result_outputs.append((ids, code_output, word_output, code_outputs_prob, word_outputs_prob))
+            code_output, word_output, copy_outputs, code_outputs_prob, word_outputs_prob = results[-5:]
+            result_outputs.append([ids] + results[-5:])
 
         result_loss.append(float(err))
         batch_number = j + 1
@@ -178,23 +183,31 @@ def ungroup_outputs(outputs,
         return samples
     ids = [_id for _iid, *_ in outputs for _id in _iid]
     outputs_prob = [(code_prob, word_prob) for *_, code_prob, word_prob in outputs]
-    outputs = [(code, word) for _, code, word, *_ in outputs]
+    outputs = [(code, word, copy) for _, code, word, copy, *_ in outputs]
+    copy_outputs = [cp for *_, cp in outputs]
+    outputs = [(code, word) for code, word, *_ in outputs]
 
+    result_copy = ungroup_inputs(copy_outputs)
     result_prob = ungroup_code_and_words(outputs_prob, [2])
     result = ungroup_code_and_words(outputs)
+    result = [(code, word, copy) for (code, word), copy in zip(result, result_copy)]
     result = ids, result, result_prob
 
     if targets is not None:
         if targets_is_data_set:
             target_lens = [
-                (code_len, word_len)
-                for *_, (_, code_tar_lens), (_, word_tar_lens) in targets
-                for code_len, word_len in zip(code_tar_lens, word_tar_lens)
+                (code_len, word_len, copy_len)
+                for *_, (_, code_tar_lens), (_, word_tar_lens), (_, copy_tar_lens) in targets
+                for code_len, word_len, copy_len in zip(code_tar_lens, word_tar_lens, copy_tar_lens)
             ]
-            targets = [(code_tar, word_tar) for *_, (code_tar, _), (word_tar, _) in targets]
+            x_targets = [(code_tar, word_tar) for *_, (code_tar, _), (word_tar, _), _ in targets]
+            y_targets = [copy_tar for *_, (copy_tar, _) in targets]
+            x_targets = ungroup_code_and_words(x_targets)
+            y_targets = ungroup_inputs(y_targets)
+            targets = [(code, word, copy) for (code, word), copy in zip(x_targets, y_targets)]
         else:
-            target_lens = None
-        result = result + (ungroup_code_and_words(targets), target_lens)
+            raise Exception('Unknown situation')
+        result = result + (targets, target_lens)
     if inputs is not None:
         if inputs_is_data_set:
             inputs_len = [
@@ -237,7 +250,7 @@ def eval_model(
     saver = tf.train.Saver(max_to_keep=100)
     with tf.Session(config=config) as sess, tf.device('/cpu:0'):
         sess.run(initializer)
-        saver.restore(sess, 'new_res/model_5')
+        saver.restore(sess, 'models/model-6')
         # saver.restore(sess, 'results/model_9_bleu_73')
         loss, outputs = run_seq2seq_model(
             data_set=batches,
@@ -249,7 +262,7 @@ def eval_model(
     print(f'loss {loss}')
     result = ungroup_outputs(outputs, targets=batches, inputs=batches)
 
-    dump_object(result, 'new_res/model_5_res')
+    dump_object(result, 'django_xyi')
 
 
 def get_sequence_up_to_end(sequence, with_end=True):
@@ -257,27 +270,10 @@ def get_sequence_up_to_end(sequence, with_end=True):
         [SEQUENCE_END_TOKEN] if with_end else [])
 
 
-def get_sources(code, words, is_generated):
-    code = get_sequence_up_to_end(code)
-    words = get_sequence_up_to_end(words, with_end=False)
-    sources = generate_source([code], [words], is_generated)
-    return sources[0]
-
-
-def tokenize_for_bleu_eval(code):
-    code = re.sub(r'([^A-Za-z0-9_])', r' \1 ', code)
-    code = re.sub(r'([a-z])([A-Z])', r'\1 \2', code)
-    code = re.sub(r'\s+', ' ', code)
-    code = code.replace('"', '`')
-    code = code.replace('\'', '`')
-    tokens = [t for t in code.split(' ') if t]
-    return tokens
-
-
 def compare_outputs_and_targets(outputs, target, target_len):
-    code_len, words_len = target_len
-    code_outputs, word_outputs = outputs
-    code_targets, word_targets = target
+    code_len, words_len, copy_len = target_len
+    code_outputs, word_outputs, copy_outputs = outputs
+    code_targets, word_targets, copy_targets = target
     real_code_outputs, real_code_targets = code_outputs[:code_len], code_targets[:code_len]
     real_word_outputs, real_word_targets = word_outputs[:words_len], word_targets[:words_len]
     # combined = insert_words_into_placeholders(code_outputs, word_outputs, WORD_PLACEHOLDER_TOKEN)
@@ -322,7 +318,7 @@ def compare_outputs_and_targets(outputs, target, target_len):
 
 
 def lookup_eval_result():
-    result = load_object('new_res/model_5_res')
+    result = load_object('django_xyi')
     ids, outputs, probs, targets, target_length, inputs, input_length = result
     stats = [
         compare_outputs_and_targets(out, tar, tar_len)
@@ -357,7 +353,9 @@ def build_loss_summary(model):
 def build_updates(model):
     loss = model.loss_with_l2
     # return tf.train.RMSPropOptimizer(0.003).minimize(loss)
-    return tf.train.AdamOptimizer(0.0005).minimize(loss)
+    return tf.train.AdamOptimizer(0.0001).minimize(loss)
+    # return tf.train.AdadeltaOptimizer(0.01).minimize(loss)
+
 
 
 def train_model(
@@ -382,6 +380,14 @@ def train_model(
         num_code_output_tokens,
         num_word_output_tokens,
     )
+
+    all_variables = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES)
+    encoder_cells = [v for v in all_variables if v.name.startswith('encoder/cell')]
+    code_decoder_cells = [v for v in all_variables if v.name.startswith('code_decoder/multi_rnn_cell/cell_1')]
+    word_decoder_cells = [v for v in all_variables if v.name.startswith('word_decoder/multi_rnn_cell/cell_1')]
+
+    model_variables = encoder_cells + code_decoder_cells + word_decoder_cells
+
     encoder_variables = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='encoder')
 
     config = tf.ConfigProto()
@@ -393,14 +399,17 @@ def train_model(
     initializer = tf.global_variables_initializer()
 
     encoder_variables_restorer = tf.train.Saver(var_list=encoder_variables)
+    model_variables_restorer = tf.train.Saver(var_list=model_variables)
+
     saver = tf.train.Saver(max_to_keep=100)
     with tf.Session(config=config) as sess, tf.device('/cpu:0'):
         summary_writer = tf.summary.FileWriter('models', sess.graph)
         sess.run(initializer)
-        encoder_variables_restorer.restore(sess, 'pretrained/pretrain_{}_{}_{}'.format(
-            ENCODER_INPUT_SIZE, ENCODER_STATE_SIZE, ENCODER_LAYERS))
+        # encoder_variables_restorer.restore(sess, 'pretrained/pretrain_{}_{}_{}'.format(
+        #     ENCODER_INPUT_SIZE, ENCODER_STATE_SIZE, ENCODER_LAYERS))
+        model_variables_restorer.restore(sess, 'models/model-6')
         try:
-            for train_epoch in range(100):
+            for train_epoch in range(1000):
                 print(f'start epoch {train_epoch}')
 
                 tr_loss = run_seq2seq_model(
@@ -421,7 +430,7 @@ def train_model(
                     epoch=train_epoch,
                     is_train=False
                 )
-                saver.save(sess, 'models/model', train_epoch)
+                saver.save(sess, 'models/hs_model', train_epoch)
                 print(f'epoch {train_epoch} train {tr_loss} valid {v_loss}')
 
         except Exception as ex:
@@ -437,13 +446,14 @@ def construct_data_sets(data_set):
             code_target=data_set[set_name]['rules'],
             word_target=data_set[set_name]['words'],
             copy_words=data_set[set_name]['copy_words'],
+            copy_target=data_set[set_name]['copy_targets'],
         )
         for set_name in ('test', 'valid', 'train')
     }
 
 
 def analyze(train):
-    with open('django_data_set_x') as f:
+    with open('hs_data_set_x') as f:
         data_set = json.load(f)
 
     constructed_data_set = construct_data_sets(data_set)
@@ -488,6 +498,6 @@ def analyze(train):
 
 
 if __name__ == '__main__':
-    # analyze(True)
+    analyze(True)
     # analyze(False)
-    lookup_eval_result()
+    # lookup_eval_result()

@@ -3,7 +3,7 @@ import collections
 import tensorflow as tf
 from tensorflow.contrib.framework.python.framework import tensor_util
 
-import utilss
+from basic_rnn_cell import BasicMultiRNNCell
 
 
 class CopyNetWrapperState(
@@ -23,41 +23,69 @@ class CopyNetWrapperState(
             super(CopyNetWrapperState, self)._replace(**kwargs))
 
 
-class CopyNetWrapper(tf.nn.rnn_cell.RNNCell):
+class CopyMultiRnnCell(BasicMultiRNNCell):
 
-    def __init__(self, cell, encoder_states, encoder_input_ids, vocab_size,
-                 gen_vocab_size=None, encoder_state_size=None, initial_cell_state=None, name=None):
-        """
-        Args:
-            cell:
-            encoder_states:
-            encoder_input_ids:
-            tgt_vocab_size:
-            gen_vocab_size:
-            encoder_state_size:
-            initial_cell_state:
-        """
-        super(CopyNetWrapper, self).__init__(name=name)
-        self._cell = cell
-        self._vocab_size = vocab_size
-        self._gen_vocab_size = gen_vocab_size or vocab_size
+    def get_initial_state(self):
+        initial_state = super(CopyMultiRnnCell, self).get_initial_state()
+        with tf.name_scope(type(self).__name__ + "ZeroState", values=[self.batch_size]):
+            last_ids = tf.zeros([self.batch_size], tf.int32) - 1
+            prob_c = tf.zeros([self.batch_size, tf.shape(self._encoder_states)[1]], tf.float32)
+            return CopyNetWrapperState(cell_state=initial_state, last_ids=last_ids, prob_c=prob_c)
+
+    def initialize_outputs_ta(self, maximum_iterations):
+        outputs_ta = tf.TensorArray(
+            dtype=tf.float32,
+            size=maximum_iterations,
+            element_shape=[self.batch_size, self.output_size]
+        )
+        copy_ta = tf.TensorArray(
+            dtype=tf.float32,
+            size=maximum_iterations,
+        )
+        return outputs_ta, copy_ta
+
+    def get_initial_input(self):
+        inputs = tf.zeros([self.batch_size, self.output_size], dtype=tf.float32)
+        last_copy = tf.zeros([self.batch_size, self._encoder_seq_length], dtype=tf.float32)
+        return inputs, last_copy
+
+    def finalize_outputs(self, final_outputs_ta):
+        outputs_ta, copy_ta = final_outputs_ta
+        outputs_ta = outputs_ta.stack()
+        copy_ta = copy_ta.stack()
+        return outputs_ta, copy_ta
+
+    def write_outputs(self, time, outputs_ta, outputs):
+        outputs_ta, copy_ta = outputs_ta
+        outputs, copy = outputs
+        outputs_ta = outputs_ta.write(time, outputs)
+        copy_ta = copy_ta.write(time, copy)
+        return outputs_ta, copy_ta
+
+    def __init__(self,
+                 num_layers, state_size, output_size, batch_size, dropout_prob,
+                 encoder_states, encoder_seq_length, encoder_state_size,
+                 encoder_input_ids, gen_vocab_size=None):
+        super(CopyMultiRnnCell, self).__init__(num_layers, state_size, output_size, batch_size, dropout_prob)
+
+        self._gen_vocab_size = gen_vocab_size or self.output_size
+
+        self._encoder_seq_length = encoder_seq_length
 
         self._encoder_input_ids = tf.transpose(encoder_input_ids, [1, 0])
         self._encoder_states = tf.transpose(encoder_states, [1, 0, 2])
-        if encoder_state_size is None:
-            encoder_state_size = self._encoder_states.shape[-1].value
-            if encoder_state_size is None:
-                raise ValueError("encoder_state_size must be set if we can't infer encoder_states last dimension size.")
         self._encoder_state_size = encoder_state_size
 
-        self._initial_cell_state = initial_cell_state
-        self._copy_weight = tf.get_variable('CopyWeight', [self._encoder_state_size, self._cell.output_size])
+        self._copy_weight = tf.get_variable('CopyWeight', [self._encoder_state_size, self.last_state_size])
         self._projection = tf.layers.Dense(self._gen_vocab_size, use_bias=False, name="OutputProjection")
 
     def __call__(self, inputs, state, scope=None):
         if not isinstance(state, CopyNetWrapperState):
             raise TypeError("Expected state to be instance of CopyNetWrapperState. "
                             "Received type %s instead." % type(state))
+
+        inputs, last_copy = inputs
+
         last_ids = state.last_ids
         prob_c = state.prob_c
         cell_state = state.cell_state
@@ -77,7 +105,8 @@ class CopyNetWrapper(tf.nn.rnn_cell.RNNCell):
         selective_read = tf.einsum("ijk,ij->ik", self._encoder_states, rou, name='einsum_selective_input')
         inputs = tf.concat([inputs, selective_read], 1)
 
-        outputs, cell_state = self._cell(inputs, cell_state, scope)
+        outputs, cell_state = super(CopyMultiRnnCell, self).__call__(inputs, cell_state, scope)
+
         generate_score = self._projection(outputs)
 
         copy_score = tf.einsum("ijk,km->ijm", self._encoder_states, self._copy_weight, name='einsum_copy_score')
@@ -90,19 +119,26 @@ class CopyNetWrapper(tf.nn.rnn_cell.RNNCell):
 
         prob_g = generate_score
         prob_c = expanded_copy_score
+
         #        mixed_score = tf.concat([generate_score, expanded_copy_score], 1)
         #        probs = tf.nn.softmax(mixed_score)
         #        prob_g = probs[:, :self._gen_vocab_size]
         #        prob_c = probs[:, self._gen_vocab_size:]
 
-        encoder_input_mask = tf.one_hot(self._encoder_input_ids, self._vocab_size)
+        encoder_input_mask = tf.one_hot(self._encoder_input_ids, self.output_size)
         prob_c_one_hot = tf.einsum("ijn,ij->in", encoder_input_mask, prob_c, name='einsum_prob_c_one_hot')
-        prob_g_total = tf.pad(prob_g, [[0, 0], [0, self._vocab_size - self._gen_vocab_size]])
+        prob_g_total = tf.pad(prob_g, [[0, 0], [0, self.output_size - self._gen_vocab_size]])
         outputs = prob_c_one_hot + prob_g_total
         last_ids = tf.argmax(outputs, axis=-1, output_type=tf.int32)
         # prob_c.set_shape([None, self._encoder_state_size])
         state = CopyNetWrapperState(cell_state=cell_state, last_ids=last_ids, prob_c=prob_c)
-        return outputs, state
+
+        return (outputs, copy_score), state
+
+
+    @property
+    def last_state_size(self):
+        return super(CopyMultiRnnCell, self).state_size[-1]
 
     @property
     def state_size(self):
@@ -111,20 +147,5 @@ class CopyNetWrapper(tf.nn.rnn_cell.RNNCell):
             It can be represented by an Integer, a TensorShape or a tuple of Integers
             or TensorShapes.
         """
-        return CopyNetWrapperState(cell_state=self._cell.state_size, last_ids=tf.TensorShape([]),
+        return CopyNetWrapperState(cell_state=self.last_state_size, last_ids=tf.TensorShape([]),
                                    prob_c=self._encoder_state_size)
-
-    @property
-    def output_size(self):
-        """Integer or TensorShape: size of outputs produced by this cell."""
-        return self._vocab_size
-
-    def zero_state(self, batch_size, dtype):
-        with tf.name_scope(type(self).__name__ + "ZeroState", values=[batch_size]):
-            if self._initial_cell_state is not None:
-                cell_state = self._initial_cell_state
-            else:
-                cell_state = self._cell.zero_state(batch_size, dtype)
-            last_ids = tf.zeros([batch_size], tf.int32) - 1
-            prob_c = tf.zeros([batch_size, tf.shape(self._encoder_states)[1]], tf.float32)
-            return CopyNetWrapperState(cell_state=cell_state, last_ids=last_ids, prob_c=prob_c)

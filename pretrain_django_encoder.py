@@ -122,7 +122,7 @@ def train(data_set, description_num_tokens, code_num_tokens, input_end_marker):
                     encoder_pc={'inputs': input_ids, 'input_len': input_length},
                     code_pc=code_analyzer.placeholders,
                 )
-                saver.save(sess, f'models/pretrain_{INPUT_SIZE}_{STATE_SIZE}_{LAYERS}', train_epoch)
+                saver.save(sess, f'models/hs_pretrain_{INPUT_SIZE}_{STATE_SIZE}_{LAYERS}', train_epoch)
                 print(f'epoch {train_epoch} train {tr_loss}')
 
         except Exception as ex:
@@ -131,7 +131,7 @@ def train(data_set, description_num_tokens, code_num_tokens, input_end_marker):
 
 
 def main():
-    with open('django_data_set_x') as f:
+    with open('hs_data_set_x') as f:
         data_set = json.load(f)
     train_set = data_set['train']
     descriptions = train_set['descriptions']
