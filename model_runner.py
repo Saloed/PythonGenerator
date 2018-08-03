@@ -4,13 +4,13 @@ from traceback import print_tb
 import numpy as np
 import tensorflow as tf
 
+from model import model_full
 from current_net_conf import *
-from model import model as model_utils
 
 
 def feed_from_data_set(data_set, model):
     for _id, *data in data_set:
-        yield _id, model_utils.make_feed(data, model)
+        yield _id, model_full.make_feed(data, model)
 
 
 def print_stats(stats):
@@ -21,8 +21,8 @@ def print_stats(stats):
 
 
 def _run_model(data_set, model, session, is_train):
-    fetches = model_utils.make_fetches(model, is_train)
-    stats_fetches = model_utils.make_stats_fetches(model)
+    fetches = model_full.make_fetches(model, is_train)
+    stats_fetches = model_full.make_stats_fetches(model)
     stats_border = len(stats_fetches)
     stats = collections.defaultdict(list)
     fetches = stats_fetches + fetches
@@ -33,7 +33,7 @@ def _run_model(data_set, model, session, is_train):
         stats_result, other_result = results[:stats_border], results[stats_border:]
         err = other_result[0]
         result_loss.append(float(err))
-        model_utils.update_stats(stats_result, stats)
+        model_full.update_stats(stats_result, stats)
         batch_number = j + 1
         if batch_number % 200 == 0:
             percent = int(j / batch_count * 100)
@@ -50,7 +50,7 @@ def train_model(
         valid_data_set,
         model,
 ):
-    encoder_variables = model_utils.get_pretrained_variables()
+    encoder_variables = model_full.get_pretrained_variables()
 
     config = tf.ConfigProto()
     # config.graph_options.optimizer_options.global_jit_level = tf.OptimizerOptions.ON_1

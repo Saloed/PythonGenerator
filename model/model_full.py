@@ -11,11 +11,11 @@ from utils import dict_to_object
 
 
 def build_model(query_tokens_count, rules_count, words_count):
-    encoder, encoder_placeholders = build_encoder(query_tokens_count)
-    rules_decoder, rules_decoder_placeholders = build_rules_decoder(encoder.last_state, rules_count)
+    query_encoder, encoder_placeholders = build_encoder(query_tokens_count)
+    rules_decoder, rules_decoder_placeholders = build_rules_decoder(query_encoder.last_state, rules_count)
     words_encoder, words_placeholders = build_words_encoder(rules_count, rules_decoder_placeholders)
     words_decoder, words_decoder_pc = build_words_decoder(words_encoder.last_state)
-    copy_mechanism = build_copy_mechanism(encoder.all_states, words_decoder.all_states, words_count)
+    copy_mechanism = build_copy_mechanism(query_encoder.all_states, words_decoder.all_states, words_count)
 
     with variable_scope('loss'):
         rules_loss, rules_stats = build_rules_loss(rules_decoder)

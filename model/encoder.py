@@ -6,11 +6,11 @@ from current_net_conf import *
 from utils import dict_to_object
 
 
-def build_encoder(query_tokens_count):
+def build_encoder_batch_specific(query_tokens_count, batch_size):
     with variable_scope('query_encoder') as scope:
         with variable_scope('placeholders'):
-            query_ids = tf.placeholder(tf.int32, [None, BATCH_SIZE], 'query_ids')
-            query_length = tf.placeholder(tf.int32, [BATCH_SIZE], 'query_length')
+            query_ids = tf.placeholder(tf.int32, [None, batch_size], 'query_ids')
+            query_length = tf.placeholder(tf.int32, [batch_size], 'query_length')
 
         embedding = tf.get_variable(
             name='input_embedding',
@@ -65,3 +65,8 @@ def build_encoder(query_tokens_count):
         }, placeholders)
 
         return encoder, placeholders
+
+
+def build_encoder(query_tokens_count):
+    return build_encoder_batch_specific(query_tokens_count, BATCH_SIZE)
+

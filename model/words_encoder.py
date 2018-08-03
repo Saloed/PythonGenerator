@@ -62,3 +62,18 @@ def build_words_encoder(rules_count, rules_decoder_placeholders):
         }, placeholders)
 
         return encoder, placeholders
+
+
+def build_words_encoder_with_rules(rules_count):
+    with variable_scope('words_encoder'):
+        with variable_scope('placeholders'):
+            rules_target = tf.placeholder(tf.int32, [None, 1], 'rules_sequence')
+            rules_sequence_length = tf.placeholder(tf.int32, [1], 'rules_sequence_length')
+
+            new_placeholders = {
+                'rules_target': rules_target,
+                'rules_sequence_length': rules_sequence_length
+            }
+    encoder, placeholders = build_words_encoder(rules_count, new_placeholders)
+    new_placeholders.update(placeholders)
+    return encoder, new_placeholders

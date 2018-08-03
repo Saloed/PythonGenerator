@@ -3,23 +3,14 @@ import json
 import batching
 import model_runner
 from current_net_conf import *
-from model import model
+from model import model_full
 
 
 def construct_data_sets(data_set):
-    args_mapping = {
-        'id': 'ids',
-        'query': 'queries',
-        'rules': 'rules_sequences',
-        'words': 'words_sequences',
-        'words_mask': 'words_sequences_masks',
-        'copy': 'copy_sequences',
-        'copy_mask': 'copy_sequences_masks',
-        'gen_or_copy': 'generate_or_copy_decision_sequences',
-    }
+
     return {
         set_name: batching.construct_data_set(**{
-            field_name: data_set[set_name][args_mapping[field_name]]
+            field_name: data_set[set_name][DATA_SET_FIELD_NAMES_MAPPING[field_name]]
             for field_name in batching.DATA_SET_FIELDS
         })
         for set_name in ('test', 'valid', 'train')
@@ -52,8 +43,8 @@ def main():
     train_batches = batching.group_by_batches(train_set, batcher, sort_key=lambda x: len(x[2]))
     valid_batches = batching.group_by_batches(valid_set, batcher, sort_key=lambda x: len(x[2]))
 
-    model_instance = model.build_model(num_query_tokens, num_rule_tokens, num_word_tokens)
-    model.apply_optimizer(model_instance)
+    model_instance = model_full.build_model(num_query_tokens, num_rule_tokens, num_word_tokens)
+    model_full.apply_optimizer(model_instance)
 
     model_runner.train_model(train_batches, valid_batches, model_instance)
 

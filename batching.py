@@ -23,7 +23,7 @@ def destruct_data_set(data_set):
 
 
 def construct_data_set(**kwargs):
-    if not kwargs.keys() & set(DATA_SET_FIELDS):
+    if not set(kwargs.keys()) & set(DATA_SET_FIELDS):
         raise Exception('Incorrect data set')
 
     data_set = list(zip(*[kwargs[name] for name in DATA_SET_FIELDS]))

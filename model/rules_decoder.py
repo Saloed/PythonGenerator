@@ -1,8 +1,9 @@
+import numpy as np
 import tensorflow as tf
 from tensorflow import variable_scope
 
 from current_net_conf import *
-from model import utils
+from model.tf_utils import *
 from model.rnn_with_dropout import MultiRnnWithDropout
 from utils import dict_to_object
 
@@ -39,9 +40,10 @@ def build_rules_decoder(encoder_last_state, rules_count):
             cell_output, cell_state = rnn_cell(inputs, state)
             projected_outputs = outputs_projection(cell_output)
             outputs_ta = outputs_ta.write(time, projected_outputs)
-            return time + 1, outputs_ta, cell_state, projected_outputs
+            probability_outputs = tf.nn.softmax(projected_outputs)
+            return time + 1, outputs_ta, cell_state, probability_outputs
 
-        _, final_outputs_ta, final_state, *_ = tf.while_loop(
+        _, final_outputs_ta, final_state, _ = tf.while_loop(
             cond=condition,
             body=body,
             loop_vars=[
@@ -67,6 +69,52 @@ def build_rules_decoder(encoder_last_state, rules_count):
         return decoder, placeholders
 
 
+def build_rules_decoder_single_step(rules_count):
+    with variable_scope("rules_decoder") as scope:
+        with variable_scope('placeholders'):
+            inputs = tf.placeholder(tf.float32, [None, rules_count])
+            states = [
+                tf.placeholder(tf.float32, [None, DECODER_STATE_SIZE])
+                for _ in range(RULES_DECODER_LAYERS)
+            ]
+
+        rnn_cell = MultiRnnWithDropout(RULES_DECODER_LAYERS, DECODER_STATE_SIZE)
+        outputs_projection = tf.layers.Dense(rules_count, name='rules_output_projection')
+
+        cell_output, cell_state = rnn_cell(inputs, states)
+        projected_outputs = outputs_projection(cell_output)
+
+        # time, batch, rules_count
+        outputs = tf.nn.softmax(projected_outputs)
+
+        def initial_state(encoder_last_state):
+            return [encoder_last_state] + [
+                np.zeros([1, DECODER_STATE_SIZE], np.float32)
+                for _ in range(RULES_DECODER_LAYERS - 1)
+            ]
+
+        def initial_inputs():
+            return np.zeros([1, rules_count], np.float32)
+
+        placeholders = {
+            'rules_decoder_inputs': inputs,
+            'rules_decoder_states': states
+        }
+
+        decoder = {
+            'rules': outputs,
+            'rules_logits': projected_outputs,
+            'rules_decoder_new_state': cell_state
+        }
+
+        initializers = {
+            'rules_decoder_inputs': initial_inputs,
+            'rules_decoder_state': initial_state
+        }
+
+        return dict_to_object(decoder), placeholders, initializers
+
+
 def build_rules_loss(decoder):
     with variable_scope("rules_decoder_loss"):
         raw_rules_loss = tf.nn.sparse_softmax_cross_entropy_with_logits(
@@ -81,9 +129,9 @@ def build_rules_loss(decoder):
     with variable_scope('stats'):
         scaled_logits = tf.nn.softmax(decoder.rules_logits)
         results = tf.argmax(scaled_logits, axis=-1)
-        rules_accuracy = utils.tf_accuracy(
+        rules_accuracy = tf_accuracy(
             predicted=results,
-            target=(decoder.rules_target),
+            target=decoder.rules_target,
             mask=loss_mask
         )
 

@@ -2,7 +2,7 @@ import tensorflow as tf
 from tensorflow import variable_scope
 
 from current_net_conf import *
-from model import utils
+from model.tf_utils import *
 from utils import dict_to_object
 
 
@@ -75,6 +75,25 @@ def build_copy_mechanism(encoder_states, decoder_states, generate_tokens_count):
         })
 
 
+def build_copy_mechanism_single_step(decoder_states, generate_tokens_count):
+    with variable_scope('copy_mechanism'):
+        with variable_scope('placeholders'):
+            encoder_states = tf.placeholder(tf.float32, [None, 1, DECODER_STATE_SIZE])
+
+    expanded_decoder_states = tf.expand_dims(decoder_states, 0)
+
+    copy_mechanism = build_copy_mechanism(encoder_states, expanded_decoder_states, generate_tokens_count)
+    placeholders = {
+        'query_encoder_states': encoder_states
+    }
+    copy_meh = dict_to_object({
+        'copy_scores': copy_mechanism.copy_scores,
+        'generated_tokens': copy_mechanism.generated_tokens,
+        'generate_or_copy': copy_mechanism.generate_or_copy_score
+    }, placeholders)
+    return copy_meh, placeholders
+
+
 def build_words_loss(copy_mechanism, decoder_placeholders):
     with variable_scope('copy_mechanism_loss'):
         with variable_scope('placeholders'):
@@ -119,7 +138,7 @@ def build_words_loss(copy_mechanism, decoder_placeholders):
         generate_logits = copy_mechanism.generated_tokens_logits
         generate_logits_scaled = tf.nn.softmax(generate_logits)
         generate_tokens = tf.argmax(generate_logits_scaled, axis=-1)
-        generate_tokens_accuracy = utils.tf_accuracy(
+        generate_tokens_accuracy = tf_accuracy(
             predicted=generate_tokens,
             target=generate_token_target,
             mask=generate_token_target_mask
@@ -128,7 +147,7 @@ def build_words_loss(copy_mechanism, decoder_placeholders):
         copy_logits = copy_mechanism.copy_scores_logits
         copy_logits_scaled = tf.nn.softmax(copy_logits)
         copy_indices = tf.argmax(copy_logits_scaled, axis=-1)
-        copy_accuracy = utils.tf_accuracy(
+        copy_accuracy = tf_accuracy(
             predicted=copy_indices,
             target=copy_target,
             mask=copy_target_mask
@@ -136,7 +155,7 @@ def build_words_loss(copy_mechanism, decoder_placeholders):
 
         decision_logits = copy_mechanism.generate_or_copy_score_logits
         decision_logits_scaled = tf.nn.sigmoid(decision_logits)
-        decision_accuracy = utils.tf_accuracy(
+        decision_accuracy = tf_accuracy(
             predicted=decision_logits_scaled,
             target=generate_or_copy_target,
             mask=loss_mask,

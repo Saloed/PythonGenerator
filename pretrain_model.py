@@ -6,7 +6,7 @@ import tensorflow as tf
 
 import batching
 from current_net_conf import *
-from model import model as full_model
+from model import model_full
 from tbcnn.BatchBuilder import prepare_sample
 from tbcnn.NetBuilder import build_net
 from tbcnn.TFParameters import init_params
@@ -45,7 +45,7 @@ def feed_from_data_set(data_set, model):
 
 
 def build_model(query_tokens_count, code_num_tokens):
-    encoder, placeholders = full_model.build_encoder(query_tokens_count)
+    encoder, placeholders = model_full.build_encoder(query_tokens_count)
 
     code_analyzer_params = init_params(code_num_tokens)
     code_analyzer = build_net(code_analyzer_params)
@@ -85,7 +85,7 @@ def run_pretrain(
 
 
 def train(data_set, model):
-    encoder_variables = full_model.get_pretrained_variables()
+    encoder_variables = model_full.get_pretrained_variables()
     initializer = tf.global_variables_initializer()
     config = tf.ConfigProto()
     saver = tf.train.Saver(var_list=encoder_variables, max_to_keep=100)
