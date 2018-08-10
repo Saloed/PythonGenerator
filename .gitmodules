@@ -1,3 +1,6 @@
 [submodule "evaluation/NL2code"]
 	path = evaluation/NL2code
 	url = git@github.com:pcyin/NL2code.git
+[submodule "tf_rename"]
+	path = tf_rename
+	url = git@gist.github.com:7c24802dd9c5e15870b4b56e22135c96.git

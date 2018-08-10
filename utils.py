@@ -11,6 +11,13 @@ def load_object(name):
         return pickle.load(f)
 
 
+class Magic:
+    def __init__(self, *args):
+        for arg in args:
+            for field_name, field_value in arg.__dict__.items():
+                setattr(self, field_name, field_value)
+
+
 class Struct:
     def __init__(self, **entries):
         self.__keys = entries.keys()

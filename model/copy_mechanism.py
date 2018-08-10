@@ -3,11 +3,43 @@ from tensorflow import variable_scope
 
 from current_net_conf import *
 from model.tf_utils import *
-from utils import dict_to_object
+from model.words_decoder import WordsDecoderPlaceholders
+
+
+class CopyMechanism:
+    def __init__(self, copy_scores, generate_or_copy_score, generated_tokens,
+                 copy_scores_logits=None, generate_or_copy_score_logits=None, generated_tokens_logits=None):
+        self.copy_scores = copy_scores
+        self.generate_or_copy_score = generate_or_copy_score
+        self.generated_tokens = generated_tokens
+
+        self.copy_scores_logits = copy_scores_logits
+        self.generate_or_copy_score_logits = generate_or_copy_score_logits
+        self.generated_tokens_logits = generated_tokens_logits
+
+
+class CopyMechanismPlaceholders:
+    def __init__(self):
+        with variable_scope('placeholders'):
+            self.generate_token_target = tf.placeholder(tf.int32, [None, BATCH_SIZE], 'token_target')
+            self.generate_token_target_mask = tf.placeholder(tf.bool, [None, BATCH_SIZE], 'token_target_mask')
+
+            self.copy_target = tf.placeholder(tf.int32, [None, BATCH_SIZE], 'copy_target')
+            self.copy_target_mask = tf.placeholder(tf.bool, [None, BATCH_SIZE], 'copy_target_mask')
+
+            self.generate_or_copy_target = tf.placeholder(tf.float32, [None, BATCH_SIZE, 2], 'generate_or_copy_target')
+
+
+class CopyMechanismPlaceholdersSingleStep:
+    def __init__(self):
+        with variable_scope('placeholders'):
+            self.query_encoder_states = tf.placeholder(tf.float32, [None, 1, WORDS_DECODER_STATE_SIZE])
 
 
 def build_copy_mechanism(encoder_states, decoder_states, generate_tokens_count):
     with variable_scope('copy_mechanism'):
+        placeholders = CopyMechanismPlaceholders()
+
         # batch, time, encoder state size
         _encoder_states = tf.transpose(encoder_states, [1, 0, 2], name='transpose_encoder_states_batch_major')
         # 1, batch, encoder time, encoder state size
@@ -25,7 +57,7 @@ def build_copy_mechanism(encoder_states, decoder_states, generate_tokens_count):
         with variable_scope('copy'):
             copy_weight = tf.get_variable(
                 name='kernel',
-                shape=[DECODER_STATE_SIZE],
+                shape=[WORDS_DECODER_STATE_SIZE],
                 dtype=tf.float32
             )
 
@@ -46,7 +78,7 @@ def build_copy_mechanism(encoder_states, decoder_states, generate_tokens_count):
         with variable_scope('decoder_state_translation'):
             decoder_state_translation = tf.get_variable(
                 name='kernel',
-                shape=[DECODER_STATE_SIZE]
+                shape=[WORDS_DECODER_STATE_SIZE]
             )
 
         # decoder_time, batch
@@ -63,76 +95,45 @@ def build_copy_mechanism(encoder_states, decoder_states, generate_tokens_count):
         generated_tokens_logits = tf.layers.dense(decoder_states, generate_tokens_count, name='tokens_projection')
         generated_tokens = tf.nn.softmax(generated_tokens_logits, name='generated_tokens_softmax')
 
-        return dict_to_object({
-            'copy_scores_logits': copy_scores_logits,
-            'copy_scores': copy_scores,
-
-            'generate_or_copy_score_logits': generate_or_copy_score_logits,
-            'generate_or_copy_score': generate_or_copy_score,
-
-            'generated_tokens_logits': generated_tokens_logits,
-            'generated_tokens': generated_tokens,
-        })
+        cm = CopyMechanism(copy_scores, generate_or_copy_score, generated_tokens,
+                           copy_scores_logits, generate_or_copy_score_logits, generated_tokens_logits)
+        return cm, placeholders
 
 
 def build_copy_mechanism_single_step(decoder_states, generate_tokens_count):
     with variable_scope('copy_mechanism'):
-        with variable_scope('placeholders'):
-            encoder_states = tf.placeholder(tf.float32, [None, 1, DECODER_STATE_SIZE])
+        placeholders = CopyMechanismPlaceholdersSingleStep()
 
     expanded_decoder_states = tf.expand_dims(decoder_states, 0)
-
-    copy_mechanism = build_copy_mechanism(encoder_states, expanded_decoder_states, generate_tokens_count)
-    placeholders = {
-        'query_encoder_states': encoder_states
-    }
-    copy_meh = dict_to_object({
-        'copy_scores': copy_mechanism.copy_scores,
-        'generated_tokens': copy_mechanism.generated_tokens,
-        'generate_or_copy': copy_mechanism.generate_or_copy_score
-    }, placeholders)
-    return copy_meh, placeholders
+    copy_mechanism, _ = build_copy_mechanism(placeholders.query_encoder_states, expanded_decoder_states,
+                                          generate_tokens_count)
+    return copy_mechanism, placeholders
 
 
-def build_words_loss(copy_mechanism, decoder_placeholders):
+def build_words_loss(copy_mechanism, decoder_placeholders, pc):
+    # type: (CopyMechanism, WordsDecoderPlaceholders, CopyMechanismPlaceholders) -> [dict, dict]
+
     with variable_scope('copy_mechanism_loss'):
-        with variable_scope('placeholders'):
-            generate_token_target = tf.placeholder(tf.int32, [None, BATCH_SIZE], 'token_target')
-            generate_token_target_mask = tf.placeholder(tf.float32, [None, BATCH_SIZE], 'token_target_mask')
-
-            copy_target = tf.placeholder(tf.int32, [None, BATCH_SIZE], 'copy_target')
-            copy_target_mask = tf.placeholder(tf.float32, [None, BATCH_SIZE], 'copy_target_mask')
-
-            generate_or_copy_target = tf.placeholder(tf.float32, [None, BATCH_SIZE, 2], 'generate_or_copy_target')
-
-        loss_mask = tf.sequence_mask(decoder_placeholders['words_sequence_length'], dtype=tf.float32)
-        loss_mask = tf.transpose(loss_mask, [1, 0])
-
+        loss_mask = tf_length_mask(decoder_placeholders.words_sequence_length)
         raw_generate_or_copy_loss = tf.nn.sigmoid_cross_entropy_with_logits(
-            labels=generate_or_copy_target,
+            labels=pc.generate_or_copy_target,
             logits=copy_mechanism.generate_or_copy_score_logits
         )
         raw_generate_or_copy_loss = tf.reduce_sum(raw_generate_or_copy_loss, axis=2)
-        masked_generate_or_copy_loss = raw_generate_or_copy_loss * loss_mask
-
-        generate_or_copy_loss = tf.reduce_sum(masked_generate_or_copy_loss)
+        generate_or_copy_loss = tf_mask_gracefully(raw_generate_or_copy_loss, loss_mask, sum_result=True)
 
         raw_generate_token_loss = tf.nn.sparse_softmax_cross_entropy_with_logits(
-            labels=generate_token_target,
+            labels=pc.generate_token_target,
             logits=copy_mechanism.generated_tokens_logits
         )
-
-        masked_generate_token_loss = raw_generate_token_loss * generate_token_target_mask
-
-        generate_token_loss = tf.reduce_sum(masked_generate_token_loss)
+        generate_token_loss = tf_mask_gracefully(raw_generate_token_loss, pc.generate_token_target_mask,
+                                                 sum_result=True)
 
         raw_copy_loss = tf.nn.sparse_softmax_cross_entropy_with_logits(
-            labels=copy_target,
+            labels=pc.copy_target,
             logits=copy_mechanism.copy_scores_logits
         )
-        masked_copy_loss = raw_copy_loss * copy_target_mask
-
-        copy_loss = tf.reduce_sum(masked_copy_loss)
+        copy_loss = tf_mask_gracefully(raw_copy_loss, pc.copy_target_mask, sum_result=True)
 
     with variable_scope('stats'):
         generate_logits = copy_mechanism.generated_tokens_logits
@@ -140,8 +141,8 @@ def build_words_loss(copy_mechanism, decoder_placeholders):
         generate_tokens = tf.argmax(generate_logits_scaled, axis=-1)
         generate_tokens_accuracy = tf_accuracy(
             predicted=generate_tokens,
-            target=generate_token_target,
-            mask=generate_token_target_mask
+            target=pc.generate_token_target,
+            mask=pc.generate_token_target_mask
         )
 
         copy_logits = copy_mechanism.copy_scores_logits
@@ -149,15 +150,15 @@ def build_words_loss(copy_mechanism, decoder_placeholders):
         copy_indices = tf.argmax(copy_logits_scaled, axis=-1)
         copy_accuracy = tf_accuracy(
             predicted=copy_indices,
-            target=copy_target,
-            mask=copy_target_mask
+            target=pc.copy_target,
+            mask=pc.copy_target_mask
         )
 
         decision_logits = copy_mechanism.generate_or_copy_score_logits
         decision_logits_scaled = tf.nn.sigmoid(decision_logits)
         decision_accuracy = tf_accuracy(
             predicted=decision_logits_scaled,
-            target=generate_or_copy_target,
+            target=pc.generate_or_copy_target,
             mask=loss_mask,
             need_round=True,
             shape=[-1, 2]
@@ -175,14 +176,4 @@ def build_words_loss(copy_mechanism, decoder_placeholders):
         'copy_loss': copy_loss
     }
 
-    placeholders = {
-        'generate_token_target': generate_token_target,
-        'generate_token_target_mask': generate_token_target_mask,
-
-        'copy_target': copy_target,
-        'copy_target_mask': copy_target_mask,
-
-        'generate_or_copy_target': generate_or_copy_target
-    }
-
-    return losses, stats, placeholders
+    return losses, stats

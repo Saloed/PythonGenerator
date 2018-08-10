@@ -1,13 +1,17 @@
 import json
+import argparse
 
 import batching
 import model_runner
 from current_net_conf import *
 from model import model_full
 
+parser = argparse.ArgumentParser()
+parser.add_argument("-m", "--model", type=str, choices=['rules', 'words'],
+                    help="select model to train")
+
 
 def construct_data_sets(data_set):
-
     return {
         set_name: batching.construct_data_set(**{
             field_name: data_set[set_name][DATA_SET_FIELD_NAMES_MAPPING[field_name]]
@@ -18,6 +22,9 @@ def construct_data_sets(data_set):
 
 
 def main():
+    args = parser.parse_args()
+    is_rules_model = args.model == 'rules'
+
     with open(DATA_SET_BASE_DIR + DATA_SET_NAME) as f:
         data_set = json.load(f)
 
@@ -43,10 +50,13 @@ def main():
     train_batches = batching.group_by_batches(train_set, batcher, sort_key=lambda x: len(x[2]))
     valid_batches = batching.group_by_batches(valid_set, batcher, sort_key=lambda x: len(x[2]))
 
-    model_instance = model_full.build_model(num_query_tokens, num_rule_tokens, num_word_tokens)
-    model_full.apply_optimizer(model_instance)
+    if is_rules_model:
+        model_instance = model_full.build_rules_model(num_rule_tokens, num_query_tokens)
+    else:
+        model_instance = model_full.build_words_model(num_query_tokens, num_rule_tokens, num_word_tokens)
 
-    model_runner.train_model(train_batches, valid_batches, model_instance)
+    model_full.apply_optimizer(model_instance, is_rules_model)
+    model_runner.train_model(train_batches, valid_batches, model_instance, is_rules_model)
 
 
 if __name__ == '__main__':

@@ -3,24 +3,34 @@ from tensorflow import variable_scope
 from tensorflow.contrib.rnn import stack_bidirectional_dynamic_rnn
 
 from current_net_conf import *
-from utils import dict_to_object
 
 
-def build_words_encoder(rules_count, rules_decoder_placeholders):
+class WordsEncoder:
+    def __init__(self, last_state, all_states):
+        self.last_state = last_state
+        self.all_states = all_states
+
+
+class WordsEncoderPlaceholders:
+    def __init__(self, batch_size):
+        with variable_scope('placeholders'):
+            self.words_rules_seq = tf.placeholder(tf.int32, [None, batch_size], 'rules_sequence')
+            self.words_rules_seq_len = tf.placeholder(tf.int32, [batch_size], 'rules_sequence_length')
+
+
+def build_words_encoder(rules_count, batch_size=BATCH_SIZE):
     with variable_scope('words_encoder') as scope:
-        rules_seq = rules_decoder_placeholders['rules_target']
-        rules_seq_length = rules_decoder_placeholders['rules_sequence_length']
-
+        placeholders = WordsEncoderPlaceholders(batch_size)
         embedding = tf.get_variable(
             name='rules_embedding',
-            shape=[rules_count, ENCODER_INPUT_SIZE],
+            shape=[rules_count, RULES_ENCODER_INPUT_SIZE],
             dtype=tf.float32
         )
 
-        prepared_inputs = tf.nn.embedding_lookup(embedding, rules_seq)
+        prepared_inputs = tf.nn.embedding_lookup(embedding, placeholders.words_rules_seq)
 
-        encoder_fw_internal_cells = [tf.nn.rnn_cell.GRUCell(ENCODER_STATE_SIZE) for _ in range(ENCODER_LAYERS)]
-        encoder_bw_internal_cells = [tf.nn.rnn_cell.GRUCell(ENCODER_STATE_SIZE) for _ in range(ENCODER_LAYERS)]
+        encoder_fw_internal_cells = [tf.nn.rnn_cell.GRUCell(ss) for ss in RULES_ENCODER_STATE_SIZE_BY_LAYER]
+        encoder_bw_internal_cells = [tf.nn.rnn_cell.GRUCell(ss) for ss in RULES_ENCODER_STATE_SIZE_BY_LAYER]
 
         encoder_fw_internal_cells = [
             tf.nn.rnn_cell.DropoutWrapper(
@@ -43,7 +53,7 @@ def build_words_encoder(rules_count, rules_decoder_placeholders):
             cells_fw=encoder_fw_internal_cells,
             cells_bw=encoder_bw_internal_cells,
             inputs=prepared_inputs,
-            sequence_length=rules_seq_length,
+            sequence_length=placeholders.words_rules_seq_len,
             time_major=True,
             dtype=tf.float32,
             scope=scope,
@@ -54,26 +64,6 @@ def build_words_encoder(rules_count, rules_decoder_placeholders):
 
         encoder_result = tf.concat([final_encoder_state_fw, final_encoder_state_bw], 1)
 
-        placeholders = {}
-
-        encoder = dict_to_object({
-            'last_state': encoder_result,
-            'all_states': encoder_output
-        }, placeholders)
+        encoder = WordsEncoder(encoder_result, encoder_output)
 
         return encoder, placeholders
-
-
-def build_words_encoder_with_rules(rules_count):
-    with variable_scope('words_encoder'):
-        with variable_scope('placeholders'):
-            rules_target = tf.placeholder(tf.int32, [None, 1], 'rules_sequence')
-            rules_sequence_length = tf.placeholder(tf.int32, [1], 'rules_sequence_length')
-
-            new_placeholders = {
-                'rules_target': rules_target,
-                'rules_sequence_length': rules_sequence_length
-            }
-    encoder, placeholders = build_words_encoder(rules_count, new_placeholders)
-    new_placeholders.update(placeholders)
-    return encoder, new_placeholders

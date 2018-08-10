@@ -3,10 +3,12 @@ from traceback import print_tb
 
 import numpy as np
 import tensorflow as tf
+from tqdm import tqdm
 
 import batching
 from current_net_conf import *
 from model import model_full
+from model.encoder import build_query_encoder_for_rules
 from tbcnn.BatchBuilder import prepare_sample
 from tbcnn.NetBuilder import build_net
 from tbcnn.TFParameters import init_params
@@ -45,7 +47,7 @@ def feed_from_data_set(data_set, model):
 
 
 def build_model(query_tokens_count, code_num_tokens):
-    encoder, placeholders = model_full.build_encoder(query_tokens_count)
+    encoder, placeholders = build_query_encoder_for_rules(query_tokens_count, batch_size=BATCH_SIZE)
 
     code_analyzer_params = init_params(code_num_tokens)
     code_analyzer = build_net(code_analyzer_params)
@@ -71,16 +73,10 @@ def run_pretrain(
         model
 ):
     result_loss = []
-    batch_count = len(data_set)
     fetches = make_fetches(model)
-    for j, feed in enumerate(feed_from_data_set(data_set, model)):
+    for feed in feed_from_data_set(data_set, model):
         err, *_ = session.run(fetches=fetches, feed_dict=feed)
         result_loss.append(float(err))
-        batch_number = j + 1
-        if batch_number % 200 == 0:
-            percent = int(j / batch_count * 100)
-            print(f'Complete {percent}')
-
     return np.mean(result_loss)
 
 
@@ -90,14 +86,14 @@ def train(data_set, model):
     config = tf.ConfigProto()
     saver = tf.train.Saver(var_list=encoder_variables, max_to_keep=100)
     pretrain_model_name = PRETRAIN_SAVE_PATH + PRETRAIN_BASE_NAME + '_{}_{}_{}'.format(
-        ENCODER_INPUT_SIZE, ENCODER_STATE_SIZE, ENCODER_LAYERS)
+        RULES_QUERY_ENCODER_INPUT_SIZE, RULES_QUERY_ENCODER_STATE_SIZE, RULES_QUERY_ENCODER_LAYERS)
     with tf.Session(config=config) as sess, tf.device('/cpu:0'):
         sess.run(initializer)
         try:
             for train_epoch in range(100):
                 print(f'start epoch {train_epoch}')
                 tr_loss = run_pretrain(
-                    data_set=data_set,
+                    data_set=tqdm(data_set, f'epoch {train_epoch}'),
                     model=model,
                     session=sess,
                 )

@@ -7,6 +7,7 @@ DATA_SET_FIELDS = [
     'id',
     'query',
     'rules',
+    'words_rules',
     'words',
     'words_mask',
     'copy',
@@ -53,15 +54,16 @@ def make_batcher(
         query_end_marker, rules_end_marker, words_end_marker, time_major=True
 ):
     def preprocess_batch(batch):
-        _id, query, rules, words, words_mask, copy, copy_mask, gen_or_copy = destruct_data_set(batch)
+        _id, query, rules, word_rules, words, words_mask, copy, copy_mask, gen_or_copy = destruct_data_set(batch)
         query = align_batch(query, query_end_marker, time_major, need_length=True)
         rules = align_batch(rules, rules_end_marker, time_major, need_length=True)
+        word_rules = align_batch(word_rules, rules_end_marker, time_major, need_length=True)
         words = align_batch(words, words_end_marker, time_major, need_length=False)
         words_mask = align_batch(words_mask, 0, time_major, need_length=False)
         copy = align_batch(copy, 0, time_major, need_length=False)
         copy_mask = align_batch(copy_mask, 0, time_major, need_length=False)
         gen_or_copy = align_batch(gen_or_copy, (0, 0), time_major, need_length=True)
-        return _id, query, rules, words, words_mask, copy, copy_mask, gen_or_copy
+        return _id, query, rules, word_rules, words, words_mask, copy, copy_mask, gen_or_copy
 
     return preprocess_batch
 

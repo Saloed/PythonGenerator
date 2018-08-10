@@ -28,6 +28,16 @@ class CodeEvaluator:
 
         return accuracy, bleu
 
+    def normalize_code(self, generated_code, example):
+        normalized_code = de_canonicalize_code(generated_code, example.meta_data['raw_code'])
+        for literal, place_holder in example.meta_data['str_map'].items():
+            quoted_pc = '\'' + place_holder + '\''
+            if quoted_pc in normalized_code:
+                normalized_code = normalized_code.replace(quoted_pc, literal)
+            if place_holder in normalized_code:
+                normalized_code = normalized_code.replace(place_holder, literal)
+        return normalized_code
+
     def _calculate_accuracy(self, generated_code, refer_source):
         refer_tokens = tokenize_code(refer_source)
         predict_tokens = tokenize_code(generated_code)
@@ -36,11 +46,7 @@ class CodeEvaluator:
     def _calculate_bleu(self, generated_code, example):
         if DATA_SET_TYPE == DJANGO_DATA_SET_TYPE:
             ref_code_for_bleu = example.meta_data['raw_code']
-            pred_code_for_bleu = de_canonicalize_code(generated_code, example.meta_data['raw_code'])
-
-            # convert canonicalized code to raw code
-            for literal, place_holder in example.meta_data['str_map'].items():
-                pred_code_for_bleu = pred_code_for_bleu.replace('\'' + place_holder + '\'', literal)
+            pred_code_for_bleu = self.normalize_code(generated_code, example)
 
         elif DATA_SET_TYPE == HS_DATA_SET_TYPE:
             ref_code_for_bleu = example.code

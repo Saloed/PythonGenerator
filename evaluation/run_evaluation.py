@@ -1,3 +1,6 @@
+from __future__ import print_function
+from __future__ import division
+
 import json
 import pickle
 
@@ -7,8 +10,9 @@ import tensorflow as tf
 import batching
 from NL2code.lang.py import parse
 from evaluation.code_evaluator import CodeEvaluator
-from evaluation.generate_code import generate_code_for_query
-from model.model_single_step import build_single_step_model
+from evaluation.generate_code import CodeGenerator
+from model.model_single_step import build_single_step_rules_model, build_single_step_words_model
+from model.model_single_step import get_rules_variables, get_words_variables
 
 from current_net_conf import *
 
@@ -37,17 +41,22 @@ def decode_tree_to_python_ast(decode_tree):
     return ast_tree
 
 
-def generate_code_for_sample(sample, test_set_examples, evaluator, **kwargs):
-    sample_id, query = sample[0], sample[1]
-    sample_decode_tree = generate_code_for_query(query, **kwargs)
+def generate_code_for_sample(sample, test_set_examples, evaluator, code_generator):
+    sample_id, query, target_rules = sample[0], sample[1], sample[2]
+    test_example = test_set_examples[sample_id]
+    raw_query = test_example.query
+
+    sample_decode_tree = code_generator.generate_code_for_query(query, raw_query)
     sample_ast = decode_tree_to_python_ast(sample_decode_tree)
     sample_code = astor.to_source(sample_ast).strip()
 
-    test_example = test_set_examples[sample_id]
     acc, bleu = evaluator.eval(sample_code, test_example)
-    print(acc, bleu)
-    print(sample_code)
-    print(test_example.code)
+    if not acc:
+        print(sample_id)
+        print(acc, bleu)
+        print(evaluator.normalize_code(sample_code, test_example))
+        print(test_example.meta_data['raw_code'])
+        print('---------------------------')
     return sample_id, sample_code
 
 
@@ -58,6 +67,9 @@ def generate_code_for_data_set(data_set, **kwargs):
     ]
 
 
+data_set_type = 'valid'  # test
+
+
 def evaluate():
     with open(DATA_SET_BASE_DIR + DATA_SET_NAME) as f:
         data_set = json.load(f)
@@ -66,10 +78,12 @@ def evaluate():
         full_data_set = pickle.load(f)
 
     test_set = batching.construct_data_set(**{
-        field_name: data_set['test'][DATA_SET_FIELD_NAMES_MAPPING[field_name]]
+        field_name: data_set[data_set_type][DATA_SET_FIELD_NAMES_MAPPING[field_name]]
         for field_name in batching.DATA_SET_FIELDS
     })
-    _, _, full_test_set = full_data_set
+    _train_set, _valid_set, _test_set = full_data_set
+
+    full_test_set = {'train': _train_set, 'valid': _valid_set, 'test': _test_set}[data_set_type]
 
     test_set_examples = {ex.raw_id: ex for ex in full_test_set.examples}
 
@@ -81,19 +95,20 @@ def evaluate():
     rules_end_marker = data_set['train']['rules_seq_end']
     word_end_marker = data_set['train']['words_seq_end']
 
-    single_step_model = build_single_step_model(num_query_tokens, num_rule_tokens, num_word_tokens)
+    rules_model = build_single_step_rules_model(num_query_tokens, num_rule_tokens)
+    words_model = build_single_step_words_model(num_query_tokens, num_rule_tokens, num_word_tokens)
 
     grammar = full_test_set.grammar
-    words_index = data_set['test']['words_index']
-    query_index = data_set['test']['query_index']
+    words_index = data_set['train']['words_index']
     words_r_index = {int(value): key for key, value in words_index.items()}
-    query_r_index = {int(value): key for key, value in query_index.items()}
 
     end_markers = {
         'query': query_end_marker,
         'rules': rules_end_marker,
         'words': word_end_marker
     }
+
+    rules_word_placeholder = data_set[data_set_type]['rules_word_pc']
 
     counts = {
         'query': num_query_tokens,
@@ -103,23 +118,31 @@ def evaluate():
 
     evaluator = CodeEvaluator()
 
-    model_saver = tf.train.Saver()
-    model_name = MODEL_SAVE_PATH + MODEL_BASE_NAME
+    rules_model_saver = tf.train.Saver(get_rules_variables())
+    words_model_saver = tf.train.Saver(get_words_variables())
+    rules_model_name = MODEL_SAVE_PATH + BEST_RULES_MODEL_BASE_NAME
+    words_model_name = MODEL_SAVE_PATH + BEST_WORDS_MODEL_BASE_NAME
 
     with tf.Session() as session:
-        model_saver.restore(session, model_name)
+        rules_model_saver.restore(session, rules_model_name)
+        words_model_saver.restore(session, words_model_name)
+
+        code_generator = CodeGenerator(
+            session=session,
+            rules_model=rules_model,
+            words_model=words_model,
+            rules_grammar=grammar,
+            words_r_index=words_r_index,
+            seq_end_markers=end_markers,
+            counts=counts,
+            rules_word_placeholder=rules_word_placeholder
+        )
 
         code_for_data_set = generate_code_for_data_set(
             test_set,
             test_set_examples=test_set_examples,
             evaluator=evaluator,
-            session=session,
-            stm=single_step_model,
-            rules_grammar=grammar,
-            words_r_index=words_r_index,
-            query_r_index=query_r_index,
-            seq_end_markers=end_markers,
-            counts=counts
+            code_generator=code_generator
         )
 
     with open('tmp/generated_code', 'wb') as f:

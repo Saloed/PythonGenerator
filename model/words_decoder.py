@@ -4,7 +4,33 @@ from tensorflow import variable_scope
 
 from current_net_conf import *
 from model.rnn_with_dropout import MultiRnnWithDropout
-from utils import dict_to_object
+
+
+class WordsDecoder:
+    def __init__(self, all_states):
+        self.all_states = all_states
+
+
+class WordsDecoderPlaceholders:
+    def __init__(self):
+        with variable_scope('placeholders'):
+            self.words_sequence_length = tf.placeholder(tf.int32, [BATCH_SIZE], 'words_sequence_length')
+
+
+class WordsDecoderSingleStep:
+    def __init__(self, words_logits, words_decoder_new_state):
+        self.words_logits = words_logits
+        self.words_decoder_new_state = words_decoder_new_state
+
+
+class WordsDecoderPlaceholdersSingleStep:
+    def __init__(self):
+        with variable_scope('placeholders'):
+            self.words_decoder_inputs = tf.placeholder(tf.float32, [1, WORDS_DECODER_STATE_SIZE])
+            self.words_decoder_state = [
+                tf.placeholder(tf.float32, [1, WORDS_DECODER_STATE_SIZE])
+                for _ in range(WORD_DECODER_LAYERS)
+            ]
 
 
 def build_words_decoder(encoder_last_state):
@@ -12,23 +38,22 @@ def build_words_decoder(encoder_last_state):
         if scope.caching_device is None:
             scope.set_caching_device(lambda op: op.device)
 
-        with variable_scope('placeholders'):
-            words_sequence_length = tf.placeholder(tf.int32, [BATCH_SIZE], 'words_sequence_length')
+        placeholders = WordsDecoderPlaceholders()
 
-        rnn_cell = MultiRnnWithDropout(WORD_DECODER_LAYERS, DECODER_STATE_SIZE)
+        rnn_cell = MultiRnnWithDropout(WORD_DECODER_LAYERS, WORDS_DECODER_STATE_SIZE)
 
         initial_time = tf.constant(0, dtype=tf.int32)
 
-        maximum_iterations = tf.reduce_max(words_sequence_length)
+        maximum_iterations = tf.reduce_max(placeholders.words_sequence_length)
 
         initial_state = rnn_cell.initial_state(encoder_last_state)
 
-        initial_inputs = rnn_cell.zero_initial_inputs(DECODER_STATE_SIZE)
+        initial_inputs = rnn_cell.zero_initial_inputs(WORDS_DECODER_STATE_SIZE)
 
         initial_outputs_ta = tf.TensorArray(
             dtype=tf.float32,
             size=maximum_iterations,
-            element_shape=[BATCH_SIZE, DECODER_STATE_SIZE]
+            element_shape=[BATCH_SIZE, WORDS_DECODER_STATE_SIZE]
         )
 
         def condition(_time, unused_outputs_ta, unused_state, unused_inputs):
@@ -49,52 +74,33 @@ def build_words_decoder(encoder_last_state):
         # time, batch, state_size
         outputs_logits = final_outputs_ta.stack()
 
-        placeholders = {
-            'words_sequence_length': words_sequence_length
-        }
-
-        decoder = dict_to_object({
-            'all_states': outputs_logits
-        }, placeholders)
+        decoder = WordsDecoder(outputs_logits)
 
         return decoder, placeholders
 
 
 def build_words_decoder_single_step():
     with variable_scope("words_decoder") as scope:
-        with variable_scope('placeholders'):
-            inputs = tf.placeholder(tf.float32, [1, DECODER_STATE_SIZE])
-            states = [
-                tf.placeholder(tf.float32, [1, DECODER_STATE_SIZE])
-                for _ in range(WORD_DECODER_LAYERS)
-            ]
+        rnn_cell = MultiRnnWithDropout(WORD_DECODER_LAYERS, WORDS_DECODER_STATE_SIZE)
 
-        rnn_cell = MultiRnnWithDropout(WORD_DECODER_LAYERS, DECODER_STATE_SIZE)
+        placeholders = WordsDecoderPlaceholdersSingleStep()
 
-        cell_output, cell_state = rnn_cell(inputs, states)
+        cell_output, cell_state = rnn_cell(placeholders.words_decoder_inputs, placeholders.words_decoder_state)
 
         def initial_state(encoder_last_state):
             return [encoder_last_state] + [
-                np.zeros([1, DECODER_STATE_SIZE], np.float32)
+                np.zeros([1, WORDS_DECODER_STATE_SIZE], np.float32)
                 for _ in range(WORD_DECODER_LAYERS - 1)
             ]
 
         def initial_inputs():
-            return np.zeros([1, DECODER_STATE_SIZE], np.float32)
+            return np.zeros([1, WORDS_DECODER_STATE_SIZE], np.float32)
 
-        placeholders = {
-            'words_decoder_inputs': inputs,
-            'words_decoder_state': states
-        }
-
-        decoder = {
-            'words_logits': cell_output,
-            'words_decoder_new_state': cell_state
-        }
+        decoder = WordsDecoderSingleStep(cell_output, cell_state)
 
         initializers = {
             'words_decoder_inputs': initial_inputs,
             'words_decoder_state': initial_state
         }
 
-        return dict_to_object(decoder), placeholders, initializers
+        return decoder, placeholders, initializers
