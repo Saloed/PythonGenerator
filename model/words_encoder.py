@@ -3,6 +3,7 @@ from tensorflow import variable_scope
 from tensorflow.contrib.rnn import stack_bidirectional_dynamic_rnn
 
 from current_net_conf import *
+from model.tf_utils import tf_conditional_lookup
 
 
 class WordsEncoder:
@@ -10,24 +11,54 @@ class WordsEncoder:
         self.last_state = last_state
         self.all_states = all_states
 
+    def fetch_all(self):
+        return [
+            self.last_state,
+            self.all_states
+        ]
+
 
 class WordsEncoderPlaceholders:
     def __init__(self, batch_size):
         with variable_scope('placeholders'):
-            self.words_rules_seq = tf.placeholder(tf.int32, [None, batch_size], 'rules_sequence')
-            self.words_rules_seq_len = tf.placeholder(tf.int32, [batch_size], 'rules_sequence_length')
+            self.parent_rules_seq_with_pc = tf.placeholder(tf.int32, [None, batch_size], 'rules_sequence')
+            self.nodes_seq_with_pc = tf.placeholder(tf.int32, [None, batch_size], 'rules_sequence')
+            self.rules_seq_with_pc = tf.placeholder(tf.int32, [None, batch_size], 'rules_sequence')
+            self.rules_seq_with_pc_len = tf.placeholder(tf.int32, [batch_size], 'rules_sequence_length')
+
+    def feed(self, rules, rules_len, parent_rules, nodes):
+        return {
+            self.rules_seq_with_pc: rules,
+            self.rules_seq_with_pc_len: rules_len,
+            self.parent_rules_seq_with_pc: parent_rules,
+            self.nodes_seq_with_pc: nodes
+        }
 
 
-def build_words_encoder(rules_count, batch_size=BATCH_SIZE):
+def build_words_encoder(rules_count, nodes_count, batch_size=BATCH_SIZE):
     with variable_scope('words_encoder') as scope:
         placeholders = WordsEncoderPlaceholders(batch_size)
-        embedding = tf.get_variable(
+
+        rules_embedding = tf.get_variable(
             name='rules_embedding',
             shape=[rules_count, RULES_ENCODER_INPUT_SIZE],
             dtype=tf.float32
         )
+        nodes_embedding = tf.get_variable(
+            name='nodes_embedding',
+            shape=[nodes_count, RULES_ENCODER_INPUT_SIZE],
+            dtype=tf.float32
+        )
 
-        prepared_inputs = tf.nn.embedding_lookup(embedding, placeholders.words_rules_seq)
+        rules = tf.nn.embedding_lookup(rules_embedding, placeholders.rules_seq_with_pc)
+
+        parent_rules_cond = tf.not_equal(placeholders.parent_rules_seq_with_pc, -1)
+        parent_rules = tf_conditional_lookup(parent_rules_cond, rules_embedding, placeholders.parent_rules_seq_with_pc)
+
+        nodes_cond = tf.not_equal(placeholders.nodes_seq_with_pc, -1)
+        nodes = tf_conditional_lookup(nodes_cond, nodes_embedding, placeholders.nodes_seq_with_pc)
+
+        prepared_inputs = tf.concat([rules, parent_rules, nodes], axis=-1)
 
         encoder_fw_internal_cells = [tf.nn.rnn_cell.GRUCell(ss) for ss in RULES_ENCODER_STATE_SIZE_BY_LAYER]
         encoder_bw_internal_cells = [tf.nn.rnn_cell.GRUCell(ss) for ss in RULES_ENCODER_STATE_SIZE_BY_LAYER]
@@ -53,7 +84,7 @@ def build_words_encoder(rules_count, batch_size=BATCH_SIZE):
             cells_fw=encoder_fw_internal_cells,
             cells_bw=encoder_bw_internal_cells,
             inputs=prepared_inputs,
-            sequence_length=placeholders.words_rules_seq_len,
+            sequence_length=placeholders.rules_seq_with_pc_len,
             time_major=True,
             dtype=tf.float32,
             scope=scope,

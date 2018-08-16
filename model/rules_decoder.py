@@ -12,6 +12,9 @@ class RulesDecoderPlaceholders:
         with variable_scope('placeholders'):
             self.rules_target = tf.placeholder(tf.int32, [None, BATCH_SIZE], 'rules_target')
             self.rules_sequence_length = tf.placeholder(tf.int32, [BATCH_SIZE], 'rules_target_length')
+            self.nodes = tf.placeholder(tf.int32, [None, BATCH_SIZE], 'nodes')
+            self.parent_rules = tf.placeholder(tf.int32, [None, BATCH_SIZE], 'parent_rules')
+            self.parent_rules_t = tf.placeholder(tf.int32, [None, BATCH_SIZE], 'parent_rules_t')
 
 
 class RulesDecoder(object):
@@ -21,20 +24,46 @@ class RulesDecoder(object):
 
 
 class RulesDecoderSingleStep(RulesDecoder):
-    def __init__(self, rules, rules_logits, rules_decoder_new_state):
+    def __init__(self, rules, rules_logits, rules_decoder_new_state, attention_context):
         super(RulesDecoderSingleStep, self).__init__(rules, rules_logits)
+        self.attention_context = attention_context
         self.rules_decoder_new_state = rules_decoder_new_state
+
+    def fetch_all(self):
+        return [
+            self.rules_decoder_new_state,
+            self.attention_context,
+            self.rules_logits,
+            self.rules
+        ]
 
 
 class RulesDecoderPlaceholdersSingleStep:
-    def __init__(self, rules_count):
+    def __init__(self):
         with variable_scope('placeholders'):
-            self.inputs = tf.placeholder(tf.float32, [None, rules_count])
             self.states = tuple([
                 tf.placeholder(tf.float32, [None, RULES_DECODER_STATE_SIZE])
                 for _ in range(RULES_DECODER_LAYERS)
             ])
             self.query_encoder_all_states = tf.placeholder(tf.float32, [None, None, RULES_DECODER_STATE_SIZE])
+
+            self.previous_rule = tf.placeholder(tf.int32, [None])
+            self.frontier_node = tf.placeholder(tf.int32, [None])
+            self.parent_rule = tf.placeholder(tf.int32, [None])
+            self.parent_rule_state = tf.placeholder(tf.float32, [None, RULES_DECODER_STATE_SIZE])
+
+            self.attention_context = tf.placeholder(tf.float32, [None, RULES_DECODER_ATTENTION_SIZE])
+
+    def feed(self, states, attention_ctx, query_states, prev_rule, frontier_node, parent_rule, parent_rule_state):
+        return {
+            self.states: states,
+            self.query_encoder_all_states: query_states,
+            self.attention_context: attention_ctx,
+            self.previous_rule: prev_rule,
+            self.frontier_node: frontier_node,
+            self.parent_rule: parent_rule,
+            self.parent_rule_state: parent_rule_state
+        }
 
 
 # Luong score
@@ -64,22 +93,69 @@ def attention(
         return attention_vec
 
 
-def build_rules_decoder(query_encoder, rules_count):
+class _RulesDecoderCell:
+    def __init__(self, rules_count, nodes_count):
+        self.rules_count = rules_count
+        self.nodes_count = nodes_count
+        self.rnn_cell = MultiRnnWithDropout(RULES_DECODER_LAYERS, RULES_DECODER_STATE_SIZE)
+
+        self.outputs_projection = tf.layers.Dense(rules_count, name='rules_output_projection')
+
+        self.node_embedding = tf.get_variable(
+            name='node_embedding',
+            shape=[nodes_count, RULES_DECODER_EMBEDDING_SIZE],
+            dtype=tf.float32
+        )
+
+        self.rule_embedding = tf.get_variable(
+            name='rule_embedding',
+            shape=[rules_count, RULES_DECODER_EMBEDDING_SIZE],
+            dtype=tf.float32
+        )
+
+    def __call__(self, previous_rule_id, parent_rule_ids, frontier_node_ids, parent_states,
+                 context, state, query_encoder_all_states):
+        rule_condition = tf.not_equal(previous_rule_id, -1)
+        parent_rule_condition = tf.not_equal(parent_rule_ids, -1)
+        frontier_node_condition = tf.not_equal(frontier_node_ids, -1)
+
+        frontier_nodes = tf_conditional_lookup(frontier_node_condition, self.node_embedding, frontier_node_ids)
+        prev_rules = tf_conditional_lookup(rule_condition, self.rule_embedding, previous_rule_id)
+        parent_rules = tf_conditional_lookup(parent_rule_condition, self.rule_embedding, parent_rule_ids)
+
+        inputs = tf.concat([prev_rules, context, parent_rules, parent_states, frontier_nodes], axis=-1)
+
+        cell_output, cell_state = self.rnn_cell(inputs, state)
+
+        attention_context = attention(cell_output, query_encoder_all_states)
+
+        projected_outputs = self.outputs_projection(cell_output)
+
+        probability_outputs = tf.nn.softmax(projected_outputs)
+        rule = tf.argmax(probability_outputs, axis=-1, output_type=tf.int32)
+
+        return cell_output, cell_state, attention_context, projected_outputs, probability_outputs, rule
+
+
+def build_rules_decoder(query_encoder, rules_count, nodes_count):
     with variable_scope("rules_decoder") as scope:
         placeholders = RulesDecoderPlaceholders()
 
         if scope.caching_device is None:
             scope.set_caching_device(lambda op: op.device)
 
-        maximum_iterations = tf.reduce_max(placeholders.rules_sequence_length)
+        decoder_cell = _RulesDecoderCell(rules_count, nodes_count)
 
-        rnn_cell = MultiRnnWithDropout(RULES_DECODER_LAYERS, RULES_DECODER_STATE_SIZE)
-        outputs_projection = tf.layers.Dense(rules_count, name='rules_output_projection')
+        maximum_iterations = tf.reduce_max(placeholders.rules_sequence_length)
 
         initial_time = tf.constant(0, dtype=tf.int32)
 
-        initial_state = rnn_cell.initial_state(query_encoder.last_state)
-        initial_inputs = rnn_cell.zero_initial_inputs(rules_count)
+        initial_rules = -tf.ones([BATCH_SIZE], dtype=tf.int32)
+        initial_context = tf.zeros([BATCH_SIZE, RULES_DECODER_ATTENTION_SIZE])
+
+        initial_state = decoder_cell.rnn_cell.initial_state(query_encoder.last_state)
+
+        initial_last_state = initial_state[-1]
 
         initial_outputs_ta = tf.TensorArray(
             dtype=tf.float32,
@@ -87,22 +163,49 @@ def build_rules_decoder(query_encoder, rules_count):
             element_shape=[BATCH_SIZE, rules_count]
         )
 
-        def condition(_time, unused_outputs_ta, unused_state, unused_inputs):
+        initial_states_ta = tf.TensorArray(
+            dtype=tf.float32,
+            size=maximum_iterations,
+            element_shape=[BATCH_SIZE, RULES_DECODER_STATE_SIZE],
+            clear_after_read=False,
+        )
+
+        def condition(_time, *args):
             return _time < maximum_iterations
 
-        def body(time, outputs_ta, state, inputs):
-            cell_output, cell_state = rnn_cell(inputs, state)
-            state_with_attention = attention(cell_output, query_encoder.all_states)
-            projected_outputs = outputs_projection(state_with_attention)
-            outputs_ta = outputs_ta.write(time, projected_outputs)
-            probability_outputs = tf.nn.softmax(projected_outputs)
-            return time + 1, outputs_ta, cell_state, probability_outputs
+        def body(time, outputs_ta, states_ta, state, context, previous_rule_id):
+            frontier_node_ids = placeholders.nodes[time]
+            parent_rule_ids = placeholders.parent_rules[time]
+            parent_rule_time = placeholders.parent_rules_t[time]
 
-        _, final_outputs_ta, final_state, _ = tf.while_loop(
+            parent_rule_condition = tf.not_equal(parent_rule_ids, -1)
+            _parent_states = tf_conditional_ta_lookup(states_ta, parent_rule_condition, parent_rule_time,
+                                                      initial_last_state)
+
+            _unbatched_states = []
+            for batch_id in range(BATCH_SIZE):
+                _unbatched_states.append(_parent_states[batch_id][batch_id])
+            parent_states = tf.stack(_unbatched_states)
+
+            cell_output, cell_state, attention_context, projected_outputs, probability_outputs, rule = decoder_cell(
+                previous_rule_id=previous_rule_id,
+                parent_rule_ids=parent_rule_ids,
+                frontier_node_ids=frontier_node_ids,
+                parent_states=parent_states,
+                context=context,
+                state=state,
+                query_encoder_all_states=query_encoder.all_states
+            )
+            states_ta = states_ta.write(time, cell_output)
+            outputs_ta = outputs_ta.write(time, projected_outputs)
+
+            return time + 1, outputs_ta, states_ta, cell_state, attention_context, rule
+
+        _, final_outputs_ta, _, final_state, _, _ = tf.while_loop(
             cond=condition,
             body=body,
             loop_vars=[
-                initial_time, initial_outputs_ta, initial_state, initial_inputs
+                initial_time, initial_outputs_ta, initial_states_ta, initial_state, initial_context, initial_rules
             ]
         )
 
@@ -115,19 +218,22 @@ def build_rules_decoder(query_encoder, rules_count):
         return decoder, placeholders
 
 
-def build_rules_decoder_single_step(rules_count):
+def build_rules_decoder_single_step(rules_count, nodes_count):
     with variable_scope("rules_decoder") as scope:
-        placeholders = RulesDecoderPlaceholdersSingleStep(rules_count)
+        placeholders = RulesDecoderPlaceholdersSingleStep()
 
-        rnn_cell = MultiRnnWithDropout(RULES_DECODER_LAYERS, RULES_DECODER_STATE_SIZE)
-        outputs_projection = tf.layers.Dense(rules_count, name='rules_output_projection')
+        decoder_cell = _RulesDecoderCell(rules_count, nodes_count)
+        cell_output, cell_state, attention_context, projected_outputs, probability_outputs, rule = decoder_cell(
+            previous_rule_id=placeholders.previous_rule,
+            parent_rule_ids=placeholders.parent_rule,
+            frontier_node_ids=placeholders.frontier_node,
+            parent_states=placeholders.parent_rule_state,
+            context=placeholders.attention_context,
+            state=placeholders.states,
+            query_encoder_all_states=placeholders.query_encoder_all_states
+        )
 
-        cell_output, cell_state = rnn_cell(placeholders.inputs, placeholders.states)
-        state_with_attention = attention(cell_output, placeholders.query_encoder_all_states)
-        projected_outputs = outputs_projection(state_with_attention)
-
-        # time, batch, rules_count
-        outputs = tf.nn.softmax(projected_outputs)
+        decoder = RulesDecoderSingleStep(probability_outputs, projected_outputs, cell_state, attention_context)
 
         def initial_state(encoder_last_state):
             return [encoder_last_state] + [
@@ -135,14 +241,12 @@ def build_rules_decoder_single_step(rules_count):
                 for _ in range(RULES_DECODER_LAYERS - 1)
             ]
 
-        def initial_inputs():
-            return np.zeros([1, rules_count], np.float32)
-
-        decoder = RulesDecoderSingleStep(outputs, projected_outputs, cell_state)
+        def initial_context():
+            return np.zeros([1, RULES_DECODER_ATTENTION_SIZE], np.float32)
 
         initializers = {
-            'rules_decoder_inputs': initial_inputs,
-            'rules_decoder_state': initial_state
+            'rules_decoder_state': initial_state,
+            'rules_decoder_context': initial_context
         }
 
         return decoder, placeholders, initializers

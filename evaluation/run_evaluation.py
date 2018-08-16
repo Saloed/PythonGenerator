@@ -42,13 +42,18 @@ def decode_tree_to_python_ast(decode_tree):
 
 
 def generate_code_for_sample(sample, test_set_examples, evaluator, code_generator):
-    sample_id, query, target_rules = sample[0], sample[1], sample[2]
+    sample_id, query = sample[0], sample[1]
+
     test_example = test_set_examples[sample_id]
     raw_query = test_example.query
 
     sample_decode_tree = code_generator.generate_code_for_query(query, raw_query)
-    sample_ast = decode_tree_to_python_ast(sample_decode_tree)
-    sample_code = astor.to_source(sample_ast).strip()
+    try:
+        sample_ast = decode_tree_to_python_ast(sample_decode_tree)
+        sample_code = astor.to_source(sample_ast).strip()
+    except Exception as ex:
+        print(ex)
+        return
 
     acc, bleu = evaluator.eval(sample_code, test_example)
     if not acc:
@@ -77,12 +82,9 @@ def evaluate():
     with open(DATA_SET_BASE_DIR + FULL_DATA_SET_NAME) as f:
         full_data_set = pickle.load(f)
 
-    test_set = batching.construct_data_set(**{
-        field_name: data_set[data_set_type][DATA_SET_FIELD_NAMES_MAPPING[field_name]]
-        for field_name in batching.DATA_SET_FIELDS
-    })
-    _train_set, _valid_set, _test_set = full_data_set
+    test_set = batching.construct_rules_data_set(data_set[data_set_type])
 
+    _train_set, _valid_set, _test_set = full_data_set
     full_test_set = {'train': _train_set, 'valid': _valid_set, 'test': _test_set}[data_set_type]
 
     test_set_examples = {ex.raw_id: ex for ex in full_test_set.examples}
@@ -90,13 +92,14 @@ def evaluate():
     num_rule_tokens = data_set['train']['rules_tokens_count']
     num_query_tokens = data_set['train']['query_tokens_count']
     num_word_tokens = data_set['train']['words_size']
+    num_rule_nodes = data_set['train']['rules_nodes_count']
 
     query_end_marker = data_set['train']['query_seq_end']
     rules_end_marker = data_set['train']['rules_seq_end']
     word_end_marker = data_set['train']['words_seq_end']
 
-    rules_model = build_single_step_rules_model(num_query_tokens, num_rule_tokens)
-    words_model = build_single_step_words_model(num_query_tokens, num_rule_tokens, num_word_tokens)
+    rules_model = build_single_step_rules_model(num_query_tokens, num_rule_tokens, num_rule_nodes)
+    words_model = build_single_step_words_model(num_query_tokens, num_rule_tokens, num_rule_nodes, num_word_tokens)
 
     grammar = full_test_set.grammar
     words_index = data_set['train']['words_index']
@@ -113,7 +116,8 @@ def evaluate():
     counts = {
         'query': num_query_tokens,
         'rules': num_rule_tokens,
-        'words': num_word_tokens
+        'words': num_word_tokens,
+        'nodes': num_rule_nodes
     }
 
     evaluator = CodeEvaluator()

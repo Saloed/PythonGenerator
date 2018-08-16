@@ -39,9 +39,9 @@ class WordsModel(FullModel):
         self.placeholders = placeholders  # type: WordsModelPlaceholders
 
 
-def build_rules_model(rules_count, query_tokens_count):
+def build_rules_model(rules_count, query_tokens_count, nodes_count):
     query_encoder, query_encoder_pc = build_query_encoder_for_rules(query_tokens_count, batch_size=BATCH_SIZE)
-    rules_decoder, rules_decoder_pc = build_rules_decoder(query_encoder, rules_count)
+    rules_decoder, rules_decoder_pc = build_rules_decoder(query_encoder, rules_count, nodes_count)
 
     with variable_scope('loss'):
         rules_loss, rules_stats = build_rules_loss(rules_decoder, rules_decoder_pc)
@@ -50,6 +50,7 @@ def build_rules_model(rules_count, query_tokens_count):
 
         loss = tf.reduce_sum(stacked_rules_loss)
 
+    with variable_scope('l2_loss'):
         variables = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES)
         l2_variables = [v for v in variables if v.name.split('/')[-1].startswith('kernel')]
         l2_losses = [tf.nn.l2_loss(v) for v in l2_variables]
@@ -65,11 +66,11 @@ def build_rules_model(rules_count, query_tokens_count):
     return model
 
 
-def build_words_model(query_tokens_count, rules_count, words_count):
+def build_words_model(query_tokens_count, rules_count, nodes_count, words_count):
     words_query_encoder, words_query_encoder_pc = build_query_encoder_for_words(query_tokens_count,
                                                                                 batch_size=BATCH_SIZE)
-    words_encoder, words_encoder_pc = build_words_encoder(rules_count)
-    words_decoder, words_decoder_pc = build_words_decoder(words_encoder.last_state)
+    words_encoder, words_encoder_pc = build_words_encoder(rules_count, nodes_count)
+    words_decoder, words_decoder_pc = build_words_decoder(words_encoder)
     copy_mechanism, copy_mechanism_pc = build_copy_mechanism(words_query_encoder.all_states, words_decoder.all_states,
                                                              words_count)
 
@@ -80,6 +81,7 @@ def build_words_model(query_tokens_count, rules_count, words_count):
 
         loss = tf.reduce_sum(stacked_words_loss)
 
+    with variable_scope('l2_loss'):
         variables = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES)
         l2_variables = [v for v in variables if v.name.split('/')[-1].startswith('kernel')]
         l2_losses = [tf.nn.l2_loss(v) for v in l2_variables]
@@ -101,38 +103,46 @@ def apply_optimizer(model_instance, is_rules_model):
         updates = optimizer.minimize(model_instance.loss)
     else:
         optimizer = tf.train.RMSPropOptimizer(0.001)
+        # optimizer = tf.train.AdamOptimizer(0.0005)
         updates = optimizer.minimize(model_instance.loss_with_l2)
     model_instance.updates = updates
 
 
 def make_rules_feed(data, model_instance):
     # type: (tuple, RulesModel) -> dict
-    (q_ids, q_length), (rules, rules_length), _, words, words_mask, copy, copy_mask, _ = data
+    (q_ids, q_length), (rules, rules_length), nodes, parent_rules, parent_rules_t = data
     pc = model_instance.placeholders
     return {
         pc.query_ids: q_ids,
         pc.query_length: q_length,
         pc.rules_sequence_length: rules_length,
         pc.rules_target: rules,
+        pc.nodes: nodes,
+        pc.parent_rules: parent_rules,
+        pc.parent_rules_t: parent_rules_t
     }
 
 
 def make_words_feed(data, model_instance):
     # type: (tuple, WordsModel) -> dict
-    (q_ids, q_length), _, (word_rules, word_rules_length), words, words_mask, copy, copy_mask, (
+    (q_ids, q_length), (rules, rules_length), nodes, parent_rules, parent_rules_t, words, words_mask, copy, copy_mask, (
         gen_or_copy, words_length) = data
     pc = model_instance.placeholders
     return {
         pc.query_ids: q_ids,
         pc.query_length: q_length,
+
         pc.generate_token_target: words,
         pc.generate_token_target_mask: words_mask,
         pc.copy_target: copy,
         pc.copy_target_mask: copy_mask,
         pc.generate_or_copy_target: gen_or_copy,
         pc.words_sequence_length: words_length,
-        pc.words_rules_seq: word_rules,
-        pc.words_rules_seq_len: word_rules_length
+
+        pc.rules_seq_with_pc: rules,
+        pc.rules_seq_with_pc_len: rules_length,
+        pc.parent_rules_seq_with_pc: parent_rules,
+        pc.nodes_seq_with_pc: nodes
     }
 
 

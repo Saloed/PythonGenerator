@@ -75,6 +75,8 @@ def train_model(
 
     saver = tf.train.Saver(max_to_keep=100)
     with tf.Session(config=config) as sess, tf.device('/cpu:0'):
+        graph_writer = tf.summary.FileWriter('tmp', sess.graph)
+
         sess.run(initializer)
         sess.run(local_initializer)
         if is_rules_model:

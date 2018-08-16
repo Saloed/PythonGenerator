@@ -62,9 +62,9 @@ class WordsModelSingleStep:
         self.words_decoder = words_decoder  # type: _WordsDecoder
 
 
-def build_single_step_rules_model(query_tokens_count, rules_count):
+def build_single_step_rules_model(query_tokens_count, rules_count, nodes_count):
     encoder, encoder_pc = build_query_encoder_for_rules(query_tokens_count, batch_size=1)
-    rules_decoder, rules_decoder_pc, rules_decoder_init = build_rules_decoder_single_step(rules_count)
+    rules_decoder, rules_decoder_pc, rules_decoder_init = build_rules_decoder_single_step(rules_count, nodes_count)
     query_encoder = _QueryEncoder(encoder, encoder_pc)
     rules_decoder = _RulesDecoder(rules_decoder, rules_decoder_pc, rules_decoder_init)
     model = RulesModelSingleStep(query_encoder, rules_decoder)
@@ -77,9 +77,9 @@ def get_rules_variables():
     return encoder_variables + decoder_variables
 
 
-def build_single_step_words_model(query_tokens_count, rules_count, words_count):
+def build_single_step_words_model(query_tokens_count, rules_count, nodes_count, words_count):
     encoder, encoder_pc = build_query_encoder_for_words(query_tokens_count, batch_size=1)
-    words_encoder, words_encoder_pc = build_words_encoder(rules_count, batch_size=1)
+    words_encoder, words_encoder_pc = build_words_encoder(rules_count, nodes_count, batch_size=1)
     words_decoder, words_decoder_pc, words_decoder_init = build_words_decoder_single_step()
     copy_mechanism, copy_mechanism_pc = build_copy_mechanism_single_step(words_decoder.words_logits, words_count)
 

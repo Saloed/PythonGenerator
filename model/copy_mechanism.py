@@ -17,6 +17,17 @@ class CopyMechanism:
         self.generate_or_copy_score_logits = generate_or_copy_score_logits
         self.generated_tokens_logits = generated_tokens_logits
 
+    def copy_mechanism_fetch(self):
+        return [
+            self.copy_scores,
+            self.generate_or_copy_score,
+            self.generated_tokens,
+
+            self.copy_scores_logits,
+            self.generate_or_copy_score_logits,
+            self.generated_tokens_logits,
+        ]
+
 
 class CopyMechanismPlaceholders:
     def __init__(self):
@@ -34,6 +45,11 @@ class CopyMechanismPlaceholdersSingleStep:
     def __init__(self):
         with variable_scope('placeholders'):
             self.query_encoder_states = tf.placeholder(tf.float32, [None, 1, WORDS_DECODER_STATE_SIZE])
+
+    def copy_mechanism_feed(self, query_states):
+        return {
+            self.query_encoder_states: query_states
+        }
 
 
 def build_copy_mechanism(encoder_states, decoder_states, generate_tokens_count):
@@ -70,7 +86,9 @@ def build_copy_mechanism(encoder_states, decoder_states, generate_tokens_count):
         # decoder_time, batch, encoder_time
         copy_scores_logits = tf.einsum('abci,i->abc', bounded_combined_states, copy_weight, name='copy_scores_logits')
         copy_scores_logits = tf.add(copy_scores_logits, copy_bias, name='add_bias')
-        copy_scores = tf.nn.softmax(copy_scores_logits, name='copy_scores_softmax')
+
+        with variable_scope('copy_scores_softmax'):
+            copy_scores = tf.nn.softmax(copy_scores_logits)
 
         # decoder_time, batch
         max_copy_score = tf.reduce_max(copy_scores, axis=2, name='max_copy_score')
@@ -106,7 +124,7 @@ def build_copy_mechanism_single_step(decoder_states, generate_tokens_count):
 
     expanded_decoder_states = tf.expand_dims(decoder_states, 0)
     copy_mechanism, _ = build_copy_mechanism(placeholders.query_encoder_states, expanded_decoder_states,
-                                          generate_tokens_count)
+                                             generate_tokens_count)
     return copy_mechanism, placeholders
 
 
