@@ -2,28 +2,43 @@ from __future__ import print_function
 
 import numpy as np
 import tensorflow as tf
-
 from NL2code.lang.grammar import Grammar
+
+from batching import align_batch
 from current_net_conf import *
 from evaluation.structures import RulesTree, NODE_VALUE_PLACEHOLDER
 from model.model_single_step import RulesModelSingleStep
+from model.model_single_step import SelectorModel
 from model.model_single_step import WordsModelSingleStep
+from model.rnn_with_dropout import RnnDropoutPlaceholders, EncoderDropoutPlaceholders
+
+
+def add_dropout_feed(feed):
+    feed.update(RnnDropoutPlaceholders.feed(1.0))
+    feed.update(EncoderDropoutPlaceholders.feed(1.0))
+    return feed
 
 
 class CodeGenerator:
-    def __init__(self, session, rules_model, words_model, rules_grammar, words_r_index, seq_end_markers,
+    def __init__(self, session, rules_model, words_model, selector_model, rules_grammar, words_r_index, seq_end_markers,
                  counts, rules_word_placeholder):
         self.session = session  # type: tf.Session
         self.rules_model = rules_model  # type: RulesModelSingleStep
         self.words_model = words_model  # type: WordsModelSingleStep
+        self.selector_model = selector_model  # type: SelectorModel
         self.rules_grammar = rules_grammar  # type: Grammar
         self.words_r_index = words_r_index
         self.seq_end_markers = seq_end_markers
         self.counts = counts
         self.rules_word_placeholder = rules_word_placeholder
 
-        self.rules_decoder = self.rules_model.rules_decoder
-        self.words_decoder = self.words_model.words_decoder
+    @property
+    def words_decoder(self):
+        return self.words_model.words_decoder
+
+    @property
+    def rules_decoder(self):
+        return self.rules_model.rules_decoder
 
     def rule_trees_next_step(self, rule_trees, encoder_all_states):
 
@@ -32,6 +47,9 @@ class CodeGenerator:
             for rt in rule_trees
         ]
         encoder_all_states_value = np.concatenate(many_encoder_all_states, axis=1)
+
+        query_length = encoder_all_states.shape[0]
+        query_length_value = [query_length for rt in rule_trees]
 
         states_and_ctx = [rt.get_state() for rt in rule_trees]
         parent_data = [rt.get_parent_id_and_state() for rt in rule_trees]
@@ -54,11 +72,13 @@ class CodeGenerator:
             states=decoder_state_values,
             attention_ctx=attention_ctx,
             query_states=encoder_all_states_value,
+            query_length=query_length_value,
             prev_rule=rules,
             frontier_node=nodes,
             parent_rule=parent_rules,
             parent_rule_state=parent_state
         )
+        feed = add_dropout_feed(feed)
 
         fetches = self.rules_decoder.outputs.fetch_all()
 
@@ -83,6 +103,7 @@ class CodeGenerator:
             decoder_input: initial_input,
             query_encoder_all_states: encoder_all_states
         }
+        feed = add_dropout_feed(feed)
 
         end_marker = self.seq_end_markers['rules']
         rules_count = self.counts['rules']
@@ -143,16 +164,22 @@ class CodeGenerator:
 
                 frontier_nt = rule_tree.frontier_nt()
                 possible_rules = self.rules_grammar[frontier_nt.as_type_node]
+
+                rule_tree_next_trees = []
+
                 for rule in possible_rules:
                     rule_id = self.rules_grammar.rule_to_id[rule]
                     score = np.log(next_rule_probs[rule_id])
                     # score = next_rule_probs[rule_id]
                     new_tree = rule_tree.apply(rule, score)
                     new_tree.set_state(next_state)
-                    new_rule_trees.append(new_tree)
+                    rule_tree_next_trees.append(new_tree)
 
                     new_tree.best_rules = best_rules
                     new_tree.rule = rule
+
+                rule_tree_next_trees.sort(key=lambda rt: -rt.score)
+                new_rule_trees += rule_tree_next_trees[:RULE_TREE_BEAM_SIZE]
 
             not_completed_rule_trees = []
             for rule_tree in new_rule_trees:
@@ -161,15 +188,21 @@ class CodeGenerator:
                 else:
                     not_completed_rule_trees.append(rule_tree)
 
-            if len(completed_rule_trees) > RULES_BEAM_SIZE:
+            not_completed_rule_trees.sort(key=lambda rt: -rt.score)
+
+            if not not_completed_rule_trees:
                 break
 
-            not_completed_rule_trees.sort(key=lambda rt: -rt.score)
+            best_completed_score = max([rt.score for rt in completed_rule_trees] or [-100])
+            no_one_beat_the_best = not_completed_rule_trees[0].score < best_completed_score
+
+            if len(completed_rule_trees) > 3 * RULES_BEAM_SIZE and no_one_beat_the_best:
+                break
+
             active_rule_trees = not_completed_rule_trees[:RULES_BEAM_SIZE]
 
         completed_rule_trees.sort(key=lambda rt: -rt.score)
-        completed_rule_tree_view = [rt.view for rt in completed_rule_trees]
-        return completed_rule_trees[0]
+        return completed_rule_trees
 
     def words_next_step(self, state, context, raw_query, encoder_states, query_states):
 
@@ -182,6 +215,7 @@ class CodeGenerator:
             query_states=query_states
         )
         decoder_feed.update(copy_feed)
+        decoder_feed = add_dropout_feed(decoder_feed)
 
         decoder_fetches = [
             self.words_decoder.outputs.new_state,
@@ -287,6 +321,8 @@ class CodeGenerator:
             parent_rules=[[pr] for pr in parent_rules],
             rules_len=[len(rules)]
         )
+        feed = add_dropout_feed(feed)
+
         fetch = words_encoder.outputs.fetch_all()
         last_state, all_states = self.session.run(fetch, feed)
         return last_state, all_states
@@ -297,6 +333,8 @@ class CodeGenerator:
             query_encoder_pc.query_ids: [[token] for token in query],
             query_encoder_pc.query_length: [len(query)],
         }
+        query_encoder_feed = add_dropout_feed(query_encoder_feed)
+
         query_encoder_all_states = self.session.run(
             fetches=self.words_model.query_encoder.outputs.all_states,
             feed_dict=query_encoder_feed
@@ -325,19 +363,69 @@ class CodeGenerator:
             self.rules_model.query_encoder.outputs.last_state,
             self.rules_model.query_encoder.outputs.all_states
         ]
+        query_encoder_feed = add_dropout_feed(query_encoder_feed)
+
         query_encoder_last_state, query_encoder_all_states = self.session.run(
             fetches=query_encoder_fetches,
             feed_dict=query_encoder_feed
         )
 
-        rule_tree = self.beam_search_rules(
+        rule_trees = self.beam_search_rules(
             encoder_last_state=query_encoder_last_state,
             encoder_all_states=query_encoder_all_states,
         )
-        return rule_tree
+        return rule_trees
 
     def generate_code_for_query(self, query, raw_query):
-        rule_tree = self.generate_rules_for_query(query, raw_query)
+        rule_trees = self.generate_rules_for_query(query, raw_query)
+        rule_tree = self.select_best_rule_tree(rule_trees, query)
         words = self.generate_words_for_rule_tree(rule_tree, query, raw_query)
         result = self.fill_placeholders(rule_tree, words)
         return result
+
+    def dummy_generate_code(self, query, raw_query, rules, words, copy, word_or_copy):
+        # root = RulesTree.create_new(self.rules_grammar)
+        # for rule_id in rules:
+        #     rule = self.rules_grammar.id_to_rule[rule_id]
+        #     root = root.apply(rule, 0)
+
+        rule_trees = self.generate_rules_for_query(query, raw_query)
+        root = rule_trees[0]
+        # root = self.select_best_rule_tree(rule_trees, query)
+
+        result_words = []
+        for word, cp, w_or_c in zip(words, copy, word_or_copy):
+            copy_prob, gen_prob = w_or_c
+            if gen_prob > copy_prob:
+                result = self.words_r_index[word]
+            if copy_prob >= gen_prob or result == '<unk>':
+                result = raw_query[cp]
+            result_words.append(result)
+
+        words_for_placement = self.split_words_by_eos(result_words)
+        result = self.fill_placeholders(root, words_for_placement)
+        return result
+
+    def _make_scoring_feed(self, rule_trees, query):
+        rules_end = self.seq_end_markers['rules']
+        nodes_end = self.seq_end_markers['nodes']
+        all_rules, all_nodes, all_pr = [], [], []
+        for rule_tree in rule_trees:
+            rules, nodes, parent_rules = rule_tree.make_sequence()
+            rules.append(rules_end)
+            nodes.append(nodes_end)
+            parent_rules.append(rules_end)
+            all_rules.append(rules)
+            all_nodes.append(nodes)
+            all_pr.append(parent_rules)
+        rules, rules_length = align_batch(all_rules, rules_end, need_length=True)
+        parent_rules = align_batch(all_pr, rules_end, need_length=False)
+        nodes = align_batch(all_nodes, nodes_end, need_length=False)
+        return self.selector_model.placeholders.feed(query, rules, rules_length, nodes, parent_rules)
+
+    def select_best_rule_tree(self, rule_trees, query):
+        scoring_feed = self._make_scoring_feed(rule_trees, query)
+        scoring_feed = add_dropout_feed(scoring_feed)
+        rule_tree_scores = self.session.run(self.selector_model.outputs.scores, scoring_feed)
+        best_rule_tree_id = np.argmax(rule_tree_scores)
+        return rule_trees[best_rule_tree_id]

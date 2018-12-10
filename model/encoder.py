@@ -3,6 +3,7 @@ from tensorflow import variable_scope
 from tensorflow.contrib.rnn import stack_bidirectional_dynamic_rnn
 
 from current_net_conf import *
+from model.rnn_with_dropout import apply_dropout_to_encoder_rnn_cells
 
 
 class QueryEncoder:
@@ -60,22 +61,8 @@ def _build_query_encoder(query_tokens_count, name_prefix, state_size, emb_size, 
             encoder_fw_internal_cells = [tf.nn.rnn_cell.GRUCell(state_size) for _ in range(num_layers)]
             encoder_bw_internal_cells = [tf.nn.rnn_cell.GRUCell(state_size) for _ in range(num_layers)]
 
-        encoder_fw_internal_cells = [
-            tf.nn.rnn_cell.DropoutWrapper(
-                cell=cell,
-                output_keep_prob=ENCODER_DROPOUT_PROB,
-                state_keep_prob=ENCODER_DROPOUT_PROB
-            )
-            for cell in encoder_fw_internal_cells
-        ]
-        encoder_bw_internal_cells = [
-            tf.nn.rnn_cell.DropoutWrapper(
-                cell=cell,
-                output_keep_prob=ENCODER_DROPOUT_PROB,
-                state_keep_prob=ENCODER_DROPOUT_PROB
-            )
-            for cell in encoder_bw_internal_cells
-        ]
+        encoder_fw_internal_cells = apply_dropout_to_encoder_rnn_cells(encoder_fw_internal_cells)
+        encoder_bw_internal_cells = apply_dropout_to_encoder_rnn_cells(encoder_bw_internal_cells)
 
         encoder_output, encoder_state_fw, encoder_state_bw = stack_bidirectional_dynamic_rnn(
             cells_fw=encoder_fw_internal_cells,

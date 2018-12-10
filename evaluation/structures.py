@@ -3,6 +3,25 @@ from NL2code.astnode import DecodeTree
 NODE_VALUE_PLACEHOLDER = '__<PLACEHOLDER>__'
 
 
+def decode_tree_copy(self):
+    new_tree = DecodeTree(self.type, self.label, value=self.value, t=self.t)
+    new_tree.applied_rule = self.applied_rule
+
+    if hasattr(self, 'rt'):
+        new_tree.rt = self.rt
+
+    if self.is_leaf:
+        return new_tree
+
+    for child in self.children:
+        new_tree.add_child(child.copy())
+
+    return new_tree
+
+
+DecodeTree.copy = decode_tree_copy
+
+
 class RulesTreeRepr:
     @staticmethod
     def get_nodes(node):
@@ -109,8 +128,10 @@ class RulesTree:
         self.__state = state
 
     def get_parent_id_and_state(self):
-        if self.parent is not None:
-            return self.parent.rule_id, self.parent.get_state()
+        nt = self.frontier_nt()
+        if nt.parent:
+            rt = nt.parent.rt
+            return rt.rule_id, rt.get_state()
         # this node is root
         return self.root_parent_data
 
@@ -143,6 +164,8 @@ class RulesTree:
         # record the ApplyRule action that is used to expand the current node
         nt.applied_rule = rule
 
+        nt.rt = self
+
         for child_node in rule.children:
             child = DecodeTree(child_node.type, child_node.label, child_node.value)
             nt.add_child(child)
@@ -160,6 +183,7 @@ class RulesTree:
         if nt.value is None:
             # this terminal node is empty
             nt.t = self.time
+            nt.rt = self
             nt.value = NODE_VALUE_PLACEHOLDER
             self.placeholders_count += 1
         else:
@@ -190,6 +214,9 @@ class RulesTree:
             return _frontier_nt
 
     def make_sequence_with_placeholders(self, rules_word_pc):
+        return self.make_sequence(rules_word_pc)
+
+    def make_sequence(self, rules_word_pc=None):
         #  fixme: wtf?????
         # if not self.is_finished():
         #     raise Exception('Dont make sequence for unfinished trees')
@@ -201,6 +228,8 @@ class RulesTree:
 
         def visit_tree(node):
             rule = node.applied_rule
+            if rules_word_pc is None and rule is None:
+                return
             rule_id = grammar.rule_to_id[rule] if rule is not None else rules_word_pc
             node_id = get_node_type_id(grammar, node.as_type_node)
             parent = node.parent

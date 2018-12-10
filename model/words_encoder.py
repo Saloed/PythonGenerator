@@ -3,7 +3,8 @@ from tensorflow import variable_scope
 from tensorflow.contrib.rnn import stack_bidirectional_dynamic_rnn
 
 from current_net_conf import *
-from model.tf_utils import tf_conditional_lookup
+from model.rnn_with_dropout import apply_dropout_to_encoder_rnn_cells
+from model.tf_utils import tf_conditional_lookup, tf_print_shape
 
 
 class WordsEncoder:
@@ -21,8 +22,8 @@ class WordsEncoder:
 class WordsEncoderPlaceholders:
     def __init__(self, batch_size):
         with variable_scope('placeholders'):
-            self.parent_rules_seq_with_pc = tf.placeholder(tf.int32, [None, batch_size], 'rules_sequence')
-            self.nodes_seq_with_pc = tf.placeholder(tf.int32, [None, batch_size], 'rules_sequence')
+            self.parent_rules_seq_with_pc = tf.placeholder(tf.int32, [None, batch_size], 'parent_rules_sequence')
+            self.nodes_seq_with_pc = tf.placeholder(tf.int32, [None, batch_size], 'nodes_sequence')
             self.rules_seq_with_pc = tf.placeholder(tf.int32, [None, batch_size], 'rules_sequence')
             self.rules_seq_with_pc_len = tf.placeholder(tf.int32, [batch_size], 'rules_sequence_length')
 
@@ -63,22 +64,8 @@ def build_words_encoder(rules_count, nodes_count, batch_size=BATCH_SIZE):
         encoder_fw_internal_cells = [tf.nn.rnn_cell.GRUCell(ss) for ss in RULES_ENCODER_STATE_SIZE_BY_LAYER]
         encoder_bw_internal_cells = [tf.nn.rnn_cell.GRUCell(ss) for ss in RULES_ENCODER_STATE_SIZE_BY_LAYER]
 
-        encoder_fw_internal_cells = [
-            tf.nn.rnn_cell.DropoutWrapper(
-                cell=cell,
-                output_keep_prob=ENCODER_DROPOUT_PROB,
-                state_keep_prob=ENCODER_DROPOUT_PROB
-            )
-            for cell in encoder_fw_internal_cells
-        ]
-        encoder_bw_internal_cells = [
-            tf.nn.rnn_cell.DropoutWrapper(
-                cell=cell,
-                output_keep_prob=ENCODER_DROPOUT_PROB,
-                state_keep_prob=ENCODER_DROPOUT_PROB
-            )
-            for cell in encoder_bw_internal_cells
-        ]
+        encoder_fw_internal_cells = apply_dropout_to_encoder_rnn_cells(encoder_fw_internal_cells)
+        encoder_bw_internal_cells = apply_dropout_to_encoder_rnn_cells(encoder_bw_internal_cells)
 
         encoder_output, encoder_state_fw, encoder_state_bw = stack_bidirectional_dynamic_rnn(
             cells_fw=encoder_fw_internal_cells,

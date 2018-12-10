@@ -46,6 +46,7 @@ class RulesDecoderPlaceholdersSingleStep:
                 for _ in range(RULES_DECODER_LAYERS)
             ])
             self.query_encoder_all_states = tf.placeholder(tf.float32, [None, None, RULES_DECODER_STATE_SIZE])
+            self.query_length = tf.placeholder(tf.int32, [None])
 
             self.previous_rule = tf.placeholder(tf.int32, [None])
             self.frontier_node = tf.placeholder(tf.int32, [None])
@@ -54,10 +55,12 @@ class RulesDecoderPlaceholdersSingleStep:
 
             self.attention_context = tf.placeholder(tf.float32, [None, RULES_DECODER_ATTENTION_SIZE])
 
-    def feed(self, states, attention_ctx, query_states, prev_rule, frontier_node, parent_rule, parent_rule_state):
+    def feed(self, states, attention_ctx, query_states, query_length, prev_rule, frontier_node, parent_rule,
+             parent_rule_state):
         return {
             self.states: states,
             self.query_encoder_all_states: query_states,
+            self.query_length: query_length,
             self.attention_context: attention_ctx,
             self.previous_rule: prev_rule,
             self.frontier_node: frontier_node,
@@ -93,6 +96,32 @@ def attention(
         return attention_vec
 
 
+class BahdanauAttention:
+    def __init__(self):
+        with variable_scope("attention"):
+            self.query_layer = tf.layers.Dense(RULES_DECODER_ATTENTION_SIZE, name="query_layer", use_bias=False)
+            self.memory_layer = tf.layers.Dense(RULES_DECODER_ATTENTION_SIZE, name="memory_layer", use_bias=False)
+            self.v = tf.get_variable("attention_v", [RULES_DECODER_ATTENTION_SIZE])
+
+    def __call__(self, source_states, source_state_length, hidden_states):
+        with variable_scope("attention"):
+            memory = tf.transpose(source_states, [1, 0, 2])
+            mask = tf.sequence_mask(source_state_length, dtype=tf.float32)
+            mask = tf.expand_dims(mask, 2)
+            values = memory * mask
+            keys = self.memory_layer(values)
+
+            processed_query = self.query_layer(hidden_states)
+            processed_query = tf.expand_dims(processed_query, 1)
+            score = tf.reduce_sum(self.v * tf.tanh(keys + processed_query), [2])
+            alignments = tf.nn.softmax(score)
+            weight = tf.expand_dims(alignments, 2)
+            weighted_keys = keys * weight
+            attention_vec = tf.reduce_sum(weighted_keys, axis=1)
+
+        return attention_vec
+
+
 class _RulesDecoderCell:
     def __init__(self, rules_count, nodes_count):
         self.rules_count = rules_count
@@ -113,8 +142,10 @@ class _RulesDecoderCell:
             dtype=tf.float32
         )
 
+        self.attention = BahdanauAttention()
+
     def __call__(self, previous_rule_id, parent_rule_ids, frontier_node_ids, parent_states,
-                 context, state, query_encoder_all_states):
+                 context, state, query_encoder_all_states, query_length):
         rule_condition = tf.not_equal(previous_rule_id, -1)
         parent_rule_condition = tf.not_equal(parent_rule_ids, -1)
         frontier_node_condition = tf.not_equal(frontier_node_ids, -1)
@@ -127,7 +158,8 @@ class _RulesDecoderCell:
 
         cell_output, cell_state = self.rnn_cell(inputs, state)
 
-        attention_context = attention(cell_output, query_encoder_all_states)
+        # attention_context = attention(cell_output, query_encoder_all_states)
+        attention_context = self.attention(query_encoder_all_states, query_length, cell_output)
 
         projected_outputs = self.outputs_projection(cell_output)
 
@@ -137,7 +169,7 @@ class _RulesDecoderCell:
         return cell_output, cell_state, attention_context, projected_outputs, probability_outputs, rule
 
 
-def build_rules_decoder(query_encoder, rules_count, nodes_count):
+def build_rules_decoder(query_encoder, query_encoder_pc, rules_count, nodes_count):
     with variable_scope("rules_decoder") as scope:
         placeholders = RulesDecoderPlaceholders()
 
@@ -194,7 +226,8 @@ def build_rules_decoder(query_encoder, rules_count, nodes_count):
                 parent_states=parent_states,
                 context=context,
                 state=state,
-                query_encoder_all_states=query_encoder.all_states
+                query_encoder_all_states=query_encoder.all_states,
+                query_length=query_encoder_pc.query_length
             )
             states_ta = states_ta.write(time, cell_output)
             outputs_ta = outputs_ta.write(time, projected_outputs)
@@ -230,7 +263,8 @@ def build_rules_decoder_single_step(rules_count, nodes_count):
             parent_states=placeholders.parent_rule_state,
             context=placeholders.attention_context,
             state=placeholders.states,
-            query_encoder_all_states=placeholders.query_encoder_all_states
+            query_encoder_all_states=placeholders.query_encoder_all_states,
+            query_length=placeholders.query_length
         )
 
         decoder = RulesDecoderSingleStep(probability_outputs, projected_outputs, cell_state, attention_context)

@@ -4,6 +4,7 @@ from tensorflow import variable_scope
 from current_net_conf import *
 from model.copy_mechanism import build_copy_mechanism, build_words_loss, CopyMechanismPlaceholders
 from model.encoder import build_query_encoder_for_rules, build_query_encoder_for_words, QueryEncoderPlaceholders
+from model.rnn_with_dropout import RnnDropoutPlaceholders, EncoderDropoutPlaceholders
 from model.rules_decoder import build_rules_decoder, build_rules_loss, RulesDecoderPlaceholders
 from model.words_decoder import build_words_decoder, WordsDecoderPlaceholders
 from model.words_encoder import build_words_encoder, WordsEncoderPlaceholders
@@ -41,7 +42,7 @@ class WordsModel(FullModel):
 
 def build_rules_model(rules_count, query_tokens_count, nodes_count):
     query_encoder, query_encoder_pc = build_query_encoder_for_rules(query_tokens_count, batch_size=BATCH_SIZE)
-    rules_decoder, rules_decoder_pc = build_rules_decoder(query_encoder, rules_count, nodes_count)
+    rules_decoder, rules_decoder_pc = build_rules_decoder(query_encoder, query_encoder_pc, rules_count, nodes_count)
 
     with variable_scope('loss'):
         rules_loss, rules_stats = build_rules_loss(rules_decoder, rules_decoder_pc)
@@ -99,7 +100,7 @@ def build_words_model(query_tokens_count, rules_count, nodes_count, words_count)
 
 def apply_optimizer(model_instance, is_rules_model):
     if is_rules_model:
-        optimizer = tf.train.AdamOptimizer(0.0005)
+        optimizer = tf.train.AdamOptimizer(0.0004)
         updates = optimizer.minimize(model_instance.loss)
     else:
         optimizer = tf.train.RMSPropOptimizer(0.001)
@@ -108,11 +109,11 @@ def apply_optimizer(model_instance, is_rules_model):
     model_instance.updates = updates
 
 
-def make_rules_feed(data, model_instance):
+def make_rules_feed(data, model_instance, is_train):
     # type: (tuple, RulesModel) -> dict
     (q_ids, q_length), (rules, rules_length), nodes, parent_rules, parent_rules_t = data
     pc = model_instance.placeholders
-    return {
+    feed = {
         pc.query_ids: q_ids,
         pc.query_length: q_length,
         pc.rules_sequence_length: rules_length,
@@ -121,14 +122,17 @@ def make_rules_feed(data, model_instance):
         pc.parent_rules: parent_rules,
         pc.parent_rules_t: parent_rules_t
     }
+    feed.update(RnnDropoutPlaceholders.feed(DROPOUT_PROB if is_train else 1.0))
+    feed.update(EncoderDropoutPlaceholders.feed(ENCODER_DROPOUT_PROB if is_train else 1.0))
+    return feed
 
 
-def make_words_feed(data, model_instance):
+def make_words_feed(data, model_instance, is_train):
     # type: (tuple, WordsModel) -> dict
     (q_ids, q_length), (rules, rules_length), nodes, parent_rules, parent_rules_t, words, words_mask, copy, copy_mask, (
         gen_or_copy, words_length) = data
     pc = model_instance.placeholders
-    return {
+    feed = {
         pc.query_ids: q_ids,
         pc.query_length: q_length,
 
@@ -144,6 +148,9 @@ def make_words_feed(data, model_instance):
         pc.parent_rules_seq_with_pc: parent_rules,
         pc.nodes_seq_with_pc: nodes
     }
+    feed.update(RnnDropoutPlaceholders.feed(DROPOUT_PROB if is_train else 1.0))
+    feed.update(EncoderDropoutPlaceholders.feed(ENCODER_DROPOUT_PROB if is_train else 1.0))
+    return feed
 
 
 def make_fetches(model_instance, is_train):

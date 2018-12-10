@@ -11,8 +11,8 @@ import batching
 from NL2code.lang.py import parse
 from evaluation.code_evaluator import CodeEvaluator
 from evaluation.generate_code import CodeGenerator
-from model.model_single_step import build_single_step_rules_model, build_single_step_words_model
-from model.model_single_step import get_rules_variables, get_words_variables
+from model.model_single_step import build_single_step_rules_model, build_single_step_words_model, build_selector_model
+from model.model_single_step import get_rules_variables, get_words_variables, get_selector_variables
 
 from current_net_conf import *
 
@@ -41,13 +41,23 @@ def decode_tree_to_python_ast(decode_tree):
     return ast_tree
 
 
-def generate_code_for_sample(sample, test_set_examples, evaluator, code_generator):
+def generate_code_for_sample(sample, test_set_examples, evaluator, code_generator, dummy_words_set):
+    code_generator = code_generator  # type: CodeGenerator
+
     sample_id, query = sample[0], sample[1]
+    #
+    # if sample_id != 16009:
+    #     return
 
     test_example = test_set_examples[sample_id]
     raw_query = test_example.query
 
-    sample_decode_tree = code_generator.generate_code_for_query(query, raw_query)
+    dummy_rules = sample[2]
+    dummy_words = dummy_words_set[sample_id]
+    words, _, copy, _, word_or_copy = dummy_words[-5:]
+    sample_decode_tree = code_generator.dummy_generate_code(query, raw_query, dummy_rules[:-1], words[:-1], copy[:-1], word_or_copy[:-1])
+
+    # sample_decode_tree = code_generator.generate_code_for_query(query, raw_query)
     try:
         sample_ast = decode_tree_to_python_ast(sample_decode_tree)
         sample_code = astor.to_source(sample_ast).strip()
@@ -83,6 +93,8 @@ def evaluate():
         full_data_set = pickle.load(f)
 
     test_set = batching.construct_rules_data_set(data_set[data_set_type])
+    words_test_set = batching.construct_words_data_set(data_set[data_set_type])
+    words_test_set = {it[0]: it for it in words_test_set}
 
     _train_set, _valid_set, _test_set = full_data_set
     full_test_set = {'train': _train_set, 'valid': _valid_set, 'test': _test_set}[data_set_type]
@@ -100,16 +112,11 @@ def evaluate():
 
     rules_model = build_single_step_rules_model(num_query_tokens, num_rule_tokens, num_rule_nodes)
     words_model = build_single_step_words_model(num_query_tokens, num_rule_tokens, num_rule_nodes, num_word_tokens)
+    selector_model = build_selector_model(num_query_tokens, num_rule_tokens, num_rule_nodes + 2)
 
     grammar = full_test_set.grammar
     words_index = data_set['train']['words_index']
     words_r_index = {int(value): key for key, value in words_index.items()}
-
-    end_markers = {
-        'query': query_end_marker,
-        'rules': rules_end_marker,
-        'words': word_end_marker
-    }
 
     rules_word_placeholder = data_set[data_set_type]['rules_word_pc']
 
@@ -119,22 +126,33 @@ def evaluate():
         'words': num_word_tokens,
         'nodes': num_rule_nodes
     }
+    end_markers = {
+        'query': query_end_marker,
+        'rules': rules_end_marker,
+        'words': word_end_marker,
+        'nodes': counts['nodes'] + 1
+    }
+    counts['nodes'] += 2
 
     evaluator = CodeEvaluator()
 
     rules_model_saver = tf.train.Saver(get_rules_variables())
     words_model_saver = tf.train.Saver(get_words_variables())
+    selector_model_saver = tf.train.Saver(get_selector_variables())
     rules_model_name = MODEL_SAVE_PATH + BEST_RULES_MODEL_BASE_NAME
     words_model_name = MODEL_SAVE_PATH + BEST_WORDS_MODEL_BASE_NAME
+    selector_model_name = MODEL_SAVE_PATH + BEST_SELECTOR_MODEL_BASE_NAME
 
     with tf.Session() as session:
         rules_model_saver.restore(session, rules_model_name)
         words_model_saver.restore(session, words_model_name)
+        selector_model_saver.restore(session, selector_model_name)
 
         code_generator = CodeGenerator(
             session=session,
             rules_model=rules_model,
             words_model=words_model,
+            selector_model=selector_model,
             rules_grammar=grammar,
             words_r_index=words_r_index,
             seq_end_markers=end_markers,
@@ -144,6 +162,7 @@ def evaluate():
 
         code_for_data_set = generate_code_for_data_set(
             test_set,
+            dummy_words_set=words_test_set,
             test_set_examples=test_set_examples,
             evaluator=evaluator,
             code_generator=code_generator

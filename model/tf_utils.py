@@ -2,15 +2,15 @@ import tensorflow as tf
 from tensorflow import variable_scope
 
 
-def print_shape(tensor, name):
+def tf_print_shape(tensor, name):
     return tf.Print(tensor, [tf.shape(tensor)], name + ' ')
 
 
-def print_value(tensor, name):
+def tf_print_value(tensor, name):
     return tf.Print(tensor, [tensor], name + ' ', summarize=100)
 
 
-def print_if_nan(tensor, name):
+def tf_print_if_nan(tensor, name):
     is_nan = tf.reduce_any(tf.is_nan(tensor))
     return tf.cond(is_nan, lambda: tf.Print(tensor, [tensor], 'NAN ' + name + ' '), lambda: tensor)
 

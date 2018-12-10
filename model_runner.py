@@ -10,9 +10,9 @@ from model import model_full
 from current_net_conf import *
 
 
-def feed_from_data_set(data_set, model, feeder):
+def feed_from_data_set(data_set, model, feeder, is_train):
     for _id, *data in data_set:
-        yield _id, feeder(data, model)
+        yield _id, feeder(data, model, is_train)
 
 
 def stats_to_str(stats):
@@ -29,7 +29,7 @@ def _run_model(data_set, model, session, is_train, stat_fetcher, stat_saver, fee
     stats = collections.defaultdict(list)
     fetches = stats_fetches + fetches
     result_loss = []
-    for ids, feed in feed_from_data_set(data_set, model, feeder):
+    for ids, feed in feed_from_data_set(data_set, model, feeder, is_train):
         results = session.run(fetches=fetches, feed_dict=feed)
         stats_result, other_result = results[:stats_border], results[stats_border:]
         loss = other_result[0]
@@ -74,7 +74,7 @@ def train_model(
     model_name = MODEL_SAVE_PATH + (RULES_MODEL_BASE_NAME if is_rules_model else WORDS_MODEL_BASE_NAME)
 
     saver = tf.train.Saver(max_to_keep=100)
-    with tf.Session(config=config) as sess, tf.device('/cpu:0'):
+    with tf.Session(config=config) as sess:
         graph_writer = tf.summary.FileWriter('tmp', sess.graph)
 
         sess.run(initializer)
